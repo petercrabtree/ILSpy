@@ -85,9 +85,9 @@ Examples:
 			CommandOptionType.SingleValue)]
 		public string OutputDirectory { get; }
 
-	[Option("-p|--project",
-			"Decompile assembly as compilable project. Requires the output directory option.",
-			CommandOptionType.NoValue)]
+		[Option("-p|--project",
+				"Decompile assembly as compilable project. Requires the output directory option.",
+				CommandOptionType.NoValue)]
 		public bool CreateCompilableProjectFlag { get; }
 
 		[Option("-t|--type <type-name>",
@@ -229,8 +229,13 @@ Examples:
 				updateCheckTask = DotNetToolUpdateChecker.CheckForPackageUpdateAsync("ilspycmd");
 			}
 
-			TextWriter output = Console.Out;
-			string outputDirectory = ResolveOutputDirectory(OutputDirectory);
+			TextWriter output = app.Out;
+			string outputDirectory = string.IsNullOrWhiteSpace(OutputDirectory)
+				// path is not set
+				? null
+				// resolve relative path, backreferences ('.' and '..') and other
+				// platform-specific path elements, like '~'.
+				: Path.GetFullPath(OutputDirectory);
 
 			if (!string.IsNullOrEmpty(outputDirectory))
 			{
@@ -240,56 +245,7 @@ Examples:
 			// validate args and dispatch to specific operation
 			try
 			{
-				if (CreateCompilableProjectFlag)
-				{
-					if (outputDirectory == null)
-					{
-						await app.Error.WriteLineAsync("Output directory (-o) must be specified when creating a project (-p).");
-						return ProgramExitCodes.EX_USAGE;
-					}
-
-					if (InputAssemblyNames.Length == 1)
-					{
-						string projectFileName = Path.Combine(
-							outputDirectory,
-							Path.GetFileNameWithoutExtension(InputAssemblyNames[0]) + ".csproj");
-						DecompileAsProject(InputAssemblyNames[0], projectFileName, GetSettings(), ReferencePaths, InputPDBFile);
-						return 0;
-					}
-
-					DecompileAsSolution(outputDirectory, InputAssemblyNames, GetSettings(), ReferencePaths, InputPDBFile);
-				}
-				else if (GenerateDiagrammer)
-				{
-					foreach (var file in InputAssemblyNames)
-					{
-						var command = new GenerateHtmlDiagrammer {
-							Assembly = file,
-							OutputFolder = OutputDirectory,
-							Include = Include,
-							Exclude = Exclude,
-							ReportExcludedTypes = ReportExcludedTypes,
-							JsonOnly = JsonOnly,
-							XmlDocs = XmlDocs,
-							StrippedNamespaces = StrippedNamespaces,
-						};
-
-						command.Run();
-					}
-				}
-				else
-				{
-					foreach (var file in InputAssemblyNames)
-					{
-						int result = PerformPerFileAction(file);
-						if (result != 0)
-						{
-							return result;
-						}
-					}
-				}
-
-				return 0;
+				return await RunAsync(app, outputDirectory, output);
 			}
 			catch (Exception ex)
 			{
@@ -312,74 +268,114 @@ Examples:
 					}
 				}
 			}
+		}
 
-			int PerformPerFileAction(string fileName)
+		async Task<int> RunAsync(CommandLineApplication app, string outputDirectory, TextWriter output)
+		{
+			if (CreateCompilableProjectFlag)
 			{
-				if (EntityTypes.Length != 0)
+				if (outputDirectory == null)
 				{
-					var values = EntityTypes.SelectMany(v => v.Split(',', ';')).ToArray();
-					HashSet<TypeKind> kinds = TypesParser.ParseSelection(values);
-					if (outputDirectory != null)
-					{
-						string outputName = Path.GetFileNameWithoutExtension(fileName);
-						output = File.CreateText(Path.Combine(outputDirectory, outputName) + ".list.txt");
-					}
-
-					return ListContent(fileName, output, kinds);
+					await app.Error.WriteLineAsync("Output directory (-o) must be specified when creating a project (-p).");
+					return ProgramExitCodes.EX_USAGE;
 				}
 
-				if (ShowILCodeFlag || ShowILSequencePointsFlag)
+				if (InputAssemblyNames.Length == 1)
 				{
-					if (outputDirectory != null)
-					{
-						string outputName = Path.GetFileNameWithoutExtension(fileName);
-						output = File.CreateText(Path.Combine(outputDirectory, outputName) + ".il");
-					}
-
-					return ShowIL(fileName, output);
+					DecompileAsProject(InputAssemblyNames[0], outputDirectory, GetSettings(), ReferencePaths, InputPDBFile);
+					return 0;
 				}
 
-				if (CreateDebugInfoFlag)
+				DecompileAsSolution(outputDirectory, InputAssemblyNames, GetSettings(), ReferencePaths, InputPDBFile);
+			}
+			else if (GenerateDiagrammer)
+			{
+				foreach (var file in InputAssemblyNames)
 				{
-					string pdbFileName;
-					if (outputDirectory != null)
-					{
-						string outputName = Path.GetFileNameWithoutExtension(fileName);
-						pdbFileName = Path.Combine(outputDirectory, outputName) + ".pdb";
-					}
-					else
-					{
-						pdbFileName = Path.ChangeExtension(fileName, ".pdb");
-					}
+					var command = new GenerateHtmlDiagrammer {
+						Assembly = file,
+						OutputFolder = OutputDirectory,
+						Include = Include,
+						Exclude = Exclude,
+						ReportExcludedTypes = ReportExcludedTypes,
+						JsonOnly = JsonOnly,
+						XmlDocs = XmlDocs,
+						StrippedNamespaces = StrippedNamespaces,
+					};
 
-					return GeneratePdbForAssembly(fileName, pdbFileName, app, settings: GetSettings(), ReferencePaths, InputPDBFile);
+					command.Run();
 				}
-
-				if (DumpPackageFlag)
+			}
+			else
+			{
+				foreach (var file in InputAssemblyNames)
 				{
-					return DumpPackageAssemblies(fileName, outputDirectory, app);
+					int result = PerformPerFileAction(file, output, outputDirectory, app);
+					if (result != 0)
+					{
+						return result;
+					}
 				}
+			}
 
+			return 0;
+		}
+		int PerformPerFileAction(string fileName, TextWriter output, string outputDirectory, CommandLineApplication app)
+		{
+			if (EntityTypes.Length != 0)
+			{
+				var values = EntityTypes.SelectMany(v => v.Split(',', ';')).ToArray();
+				HashSet<TypeKind> kinds = TypesParser.ParseSelection(values);
 				if (outputDirectory != null)
 				{
 					string outputName = Path.GetFileNameWithoutExtension(fileName);
-					var outputFileName = Path.Combine(outputDirectory,
-						(string.IsNullOrEmpty(TypeName) ? outputName : TypeName) + ".decompiled.cs");
-					output = File.CreateText(outputFileName);
+					output = File.CreateText(Path.Combine(outputDirectory, outputName) + ".list.txt");
 				}
 
-				return Decompile(fileName, output, GetSettings(), ReferencePaths, TypeName, InputPDBFile);
+				return ListContent(fileName, output, kinds);
 			}
-		}
 
-		static string ResolveOutputDirectory(string outputDirectory)
-		{
-			return string.IsNullOrWhiteSpace(outputDirectory)
-				// path is not set
-				? null
-				// resolve relative path, backreferences ('.' and '..') and other
-				// platform-specific path elements, like '~'.
-				: Path.GetFullPath(outputDirectory);
+			if (ShowILCodeFlag || ShowILSequencePointsFlag)
+			{
+				if (outputDirectory != null)
+				{
+					string outputName = Path.GetFileNameWithoutExtension(fileName);
+					output = File.CreateText(Path.Combine(outputDirectory, outputName) + ".il");
+				}
+
+				return ShowIL(fileName, output);
+			}
+
+			if (CreateDebugInfoFlag)
+			{
+				string pdbFileName;
+				if (outputDirectory != null)
+				{
+					string outputName = Path.GetFileNameWithoutExtension(fileName);
+					pdbFileName = Path.Combine(outputDirectory, outputName) + ".pdb";
+				}
+				else
+				{
+					pdbFileName = Path.ChangeExtension(fileName, ".pdb");
+				}
+
+				return GeneratePdbForAssembly(fileName, pdbFileName, app, settings: GetSettings(), ReferencePaths, InputPDBFile);
+			}
+
+			if (DumpPackageFlag)
+			{
+				return DumpPackageAssemblies(fileName, outputDirectory, app);
+			}
+
+			if (outputDirectory != null)
+			{
+				string outputName = Path.GetFileNameWithoutExtension(fileName);
+				var outputFileName = Path.Combine(outputDirectory,
+					(string.IsNullOrEmpty(TypeName) ? outputName : TypeName) + ".decompiled.cs");
+				output = File.CreateText(outputFileName);
+			}
+
+			return Decompile(fileName, output, GetSettings(), ReferencePaths, TypeName, InputPDBFile);
 		}
 
 		DecompilerSettings GetSettings()
@@ -463,12 +459,6 @@ Examples:
 			};
 		}
 
-		static DecompilerSettings UpdateSettings(DecompilerSettings settings, MetadataFile module)
-		{
-			settings.UseSdkStyleProjectFormat = WholeProjectDecompiler.CanUseSdkStyleProjectFormat(module);
-			return settings;
-		}
-
 		static CSharpDecompiler GetDecompiler(DecompilerSettings settings, string assemblyFileName, string[] referencePaths, (bool IsSet, string Value) inputPDBFile)
 		{
 			var module = new PEFile(assemblyFileName);
@@ -481,7 +471,8 @@ Examples:
 				resolver.AddSearchDirectory(path);
 			}
 
-			return new CSharpDecompiler(assemblyFileName, resolver, UpdateSettings(settings, module)) {
+			settings.UseSdkStyleProjectFormat = WholeProjectDecompiler.CanUseSdkStyleProjectFormat(module);
+			return new CSharpDecompiler(assemblyFileName, resolver, settings) {
 				DebugInfoProvider = TryLoadPDB(module, inputPDBFile),
 			};
 		}
@@ -514,8 +505,8 @@ Examples:
 			disassembler.WriteModuleContents(module);
 			return 0;
 		}
-		
-		static void DecompileAsSolution(string outputDirectory, string[] inputAssemblyNames, DecompilerSettings settings, string[] referencePaths, 
+
+		static void DecompileAsSolution(string outputDirectory, string[] inputAssemblyNames, DecompilerSettings settings, string[] referencePaths,
 			(bool IsSet, string Value) inputPDBFile)
 		{
 			var projects = new List<ProjectItem>();
@@ -539,8 +530,12 @@ Examples:
 				projects);
 		}
 
-		static ProjectId DecompileAsProject(string assemblyFileName, string projectFileName, DecompilerSettings settings, string[] referencePaths, (bool IsSet, string Value) inputPDBFile)
+		static ProjectId DecompileAsProject(string assemblyFileName, string outputDirectory, DecompilerSettings settings, string[] referencePaths, (bool IsSet, string Value) inputPDBFile)
 		{
+			string projectFileName = Path.Combine(
+				outputDirectory,
+				Path.GetFileNameWithoutExtension(assemblyFileName) + ".csproj");
+
 			var module = new PEFile(assemblyFileName);
 			var resolver = new UniversalAssemblyResolver(
 				assemblyFileName,
@@ -551,8 +546,9 @@ Examples:
 				resolver.AddSearchDirectory(path);
 			}
 
+			settings.UseSdkStyleProjectFormat = WholeProjectDecompiler.CanUseSdkStyleProjectFormat(module);
 			var decompiler = new WholeProjectDecompiler(
-				UpdateSettings(settings, module),
+				settings,
 				resolver,
 				null,
 				resolver,
@@ -580,11 +576,11 @@ Examples:
 		}
 
 		static int GeneratePdbForAssembly(
-			string assemblyFileName, 
-			string pdbFileName, 
-			CommandLineApplication app, 
-			DecompilerSettings settings, 
-			string[] referencePaths, 
+			string assemblyFileName,
+			string pdbFileName,
+			CommandLineApplication app,
+			DecompilerSettings settings,
+			string[] referencePaths,
 			(bool IsSet, string Value) inputPDBFile)
 		{
 			var module = new PEFile(assemblyFileName,
@@ -602,7 +598,8 @@ Examples:
 
 			using FileStream stream = new FileStream(pdbFileName, FileMode.OpenOrCreate, FileAccess.Write);
 			var decompiler = GetDecompiler(settings, assemblyFileName, referencePaths, inputPDBFile);
-			PortablePdbWriter.WritePdb(module, decompiler, UpdateSettings(settings, module), stream);
+			settings.UseSdkStyleProjectFormat = WholeProjectDecompiler.CanUseSdkStyleProjectFormat(module);
+			PortablePdbWriter.WritePdb(module, decompiler, settings, stream);
 
 			return 0;
 		}
@@ -610,10 +607,10 @@ Examples:
 		static int DumpPackageAssemblies(string packageFileName, string outputDirectory, CommandLineApplication app)
 		{
 			using var memoryMappedPackage = MemoryMappedFile.CreateFromFile(
-				packageFileName, 
-				FileMode.Open, 
-				null, 
-				0, 
+				packageFileName,
+				FileMode.Open,
+				null,
+				0,
 				MemoryMappedFileAccess.Read);
 			using var packageView = memoryMappedPackage.CreateViewAccessor(0, 0, MemoryMappedFileAccess.Read);
 			if (!SingleFileBundle.IsBundle(packageView, out long bundleHeaderOffset))
