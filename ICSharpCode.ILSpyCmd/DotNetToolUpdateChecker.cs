@@ -42,11 +42,11 @@ namespace ICSharpCode.ILSpyCmd
 
 				return new PackageCheckResult(runningVersion, latestVersion, comparisonResult > 0);
 			}
-#pragma warning disable RCS1075 // Avoid empty catch clause that catches System.Exception.
 			catch (Exception)
 			{
+				// intentionally swallow exception
+				// we don't want to crash the app just because we can't check for updates
 			}
-#pragma warning restore RCS1075 // Avoid empty catch clause that catches System.Exception.
 
 			return null;
 		}

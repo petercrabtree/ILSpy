@@ -24,6 +24,7 @@ using ICSharpCode.ILSpyX.PdbProvider;
 using McMaster.Extensions.CommandLineUtils;
 
 using Microsoft.Extensions.Hosting;
+// ReSharper disable UnassignedGetOnlyAutoProperty
 
 namespace ICSharpCode.ILSpyCmd
 {
@@ -57,8 +58,12 @@ Examples:
 	[ProjectOptionRequiresOutputDirectoryValidation]
 	[VersionOptionFromMember("-v|--version", Description = "Show version of ICSharpCode.Decompiler used.",
 		MemberName = nameof(DecompilerVersion))]
-	class ILSpyCmdProgram
+	// we don't actually use env, but this is the method sig expected by the host
+#pragma warning disable CS9113 // Parameter is unread.
+	class ILSpyCmdProgram(IHostEnvironment env)
+#pragma warning restore CS9113 // Parameter is unread.
 	{
+		// ReSharper disable MemberCanBePrivate.Global
 		// https://natemcmaster.github.io/CommandLineUtils/docs/advanced/generic-host.html
 		// https://github.com/natemcmaster/CommandLineUtils/blob/main/docs/samples/dependency-injection/generic-host/Program.cs
 		public static Task<int> Main(string[] args) => new HostBuilder().RunCommandLineApplicationAsync<ILSpyCmdProgram>(args);
@@ -68,7 +73,9 @@ Examples:
 		[Argument(0, "Assembly file name(s)", "The list of assemblies that is being decompiled. This argument is mandatory.")]
 		public string[] InputAssemblyNames { get; }
 
-		[Option("-o|--outputdir <directory>", "The output directory, if omitted decompiler output is written to standard out.", CommandOptionType.SingleValue)]
+		[Option("-o|--outputdir <directory>",
+			"The output directory, if omitted decompiler output is written to standard out.",
+			CommandOptionType.SingleValue)]
 		public string OutputDirectory { get; }
 
 		[Option("-p|--project", "Decompile assembly as compilable project. This requires the output directory option.", CommandOptionType.NoValue)]
@@ -91,12 +98,11 @@ Examples:
 		public (bool IsSet, string Value) InputPDBFile { get; }
 
 		[Option("-l|--list <entity-type(s)>", "Lists all entities of the specified type(s). Valid types: c(lass), i(nterface), s(truct), d(elegate), e(num)", CommandOptionType.MultipleValue)]
-		public string[] EntityTypes { get; } = Array.Empty<string>();
+		public string[] EntityTypes { get; } = [];
 
-		public string DecompilerVersion => "ilspycmd: " + typeof(ILSpyCmdProgram).Assembly.GetName().Version.ToString() +
-				Environment.NewLine
-				+ "ICSharpCode.Decompiler: " +
-				typeof(FullTypeName).Assembly.GetName().Version.ToString();
+		public static string DecompilerVersion =>
+			$"ilspycmd: {typeof(ILSpyCmdProgram).Assembly.GetName().Version}{Environment.NewLine}" +
+			$"ICSharpCode.Decompiler: {typeof(FullTypeName).Assembly.GetName().Version}";
 
 		[Option("-lv|--languageversion <version>", "C# Language version: CSharp1, CSharp2, CSharp3, " +
 			"CSharp4, CSharp5, CSharp6, CSharp7, CSharp7_1, CSharp7_2, CSharp7_3, CSharp8_0, CSharp9_0, " +
@@ -132,7 +138,8 @@ Examples:
 		#region MermaidDiagrammer options
 
 		// reused or quoted commands
-		private const string generateDiagrammerCmd = "--generate-diagrammer",
+		const string
+			generateDiagrammerCmd = "--generate-diagrammer",
 			exclude = generateDiagrammerCmd + "-exclude",
 			include = generateDiagrammerCmd + "-include";
 
@@ -141,41 +148,37 @@ Examples:
 		public bool GenerateDiagrammer { get; }
 
 		[Option(include, "An optional regular expression matching Type.FullName used to whitelist types to include in the generated diagrammer.", CommandOptionType.SingleValue)]
-		public string Include { get; set; }
+		public string Include { get; }
 
 		[Option(exclude, "An optional regular expression matching Type.FullName used to blacklist types to exclude from the generated diagrammer.", CommandOptionType.SingleValue)]
-		public string Exclude { get; set; }
+		public string Exclude { get; }
 
 		[Option(generateDiagrammerCmd + "-report-excluded", "Outputs a report of types excluded from the generated diagrammer" +
 			$" - whether by default because compiler-generated, explicitly by '{exclude}' or implicitly by '{include}'." +
 			" You may find this useful to develop and debug your regular expressions.", CommandOptionType.NoValue)]
-		public bool ReportExcludedTypes { get; set; }
+		public bool ReportExcludedTypes { get; }
 
 		[Option(generateDiagrammerCmd + "-docs", "The path or file:// URI of the XML file containing the target assembly's documentation comments." +
-			" You only need to set this if a) you want your diagrams annotated with them and b) the file name differs from that of the assmbly." +
-			" To enable XML documentation output for your assmbly, see https://learn.microsoft.com/en-us/dotnet/csharp/language-reference/xmldoc/#create-xml-documentation-output",
+			" You only need to set this if a) you want your diagrams annotated with them and b) the file name differs from that of the assembly." +
+			" To enable XML documentation output for your assembly, see https://learn.microsoft.com/en-us/dotnet/csharp/language-reference/xmldoc/#create-xml-documentation-output",
 			CommandOptionType.SingleValue)]
-		public string XmlDocs { get; set; }
+		public string XmlDocs { get; }
 
 		/// <inheritdoc cref="ILSpyX.MermaidDiagrammer.GenerateHtmlDiagrammer.StrippedNamespaces" />
 		[Option(generateDiagrammerCmd + "-strip-namespaces", "Optional space-separated namespace names that are removed for brevity from XML documentation comments." +
 			" Note that the order matters: e.g. replace 'System.Collections' before 'System' to remove both of them completely.", CommandOptionType.MultipleValue)]
-		public string[] StrippedNamespaces { get; set; }
+		public string[] StrippedNamespaces { get; }
 
 		[Option(generateDiagrammerCmd + "-json-only",
 			"Whether to generate a model.json file instead of baking it into the HTML template." +
 			" This is useful for the HTML/JS/CSS development loop.", CommandOptionType.NoValue,
 			ShowInHelpText = false)] // developer option, output is really only useful in combination with the corresponding task in html/gulpfile.js
-		public bool JsonOnly { get; set; }
+		public bool JsonOnly { get; }
 		#endregion
 
-		private readonly IHostEnvironment _env;
-		public ILSpyCmdProgram(IHostEnvironment env)
-		{
-			_env = env;
-		}
-
-		private async Task<int> OnExecuteAsync(CommandLineApplication app)
+		// ReSharper restore MemberCanBePrivate.Global
+		// ReSharper disable once UnusedMember.Local
+		async Task<int> OnExecuteAsync(CommandLineApplication app)
 		{
 			Task<PackageCheckResult> updateCheckTask = null;
 			if (!DisableUpdateCheck)
@@ -183,10 +186,10 @@ Examples:
 				updateCheckTask = DotNetToolUpdateChecker.CheckForPackageUpdateAsync("ilspycmd");
 			}
 
-			TextWriter output = System.Console.Out;
+			TextWriter output = Console.Out;
 			string outputDirectory = ResolveOutputDirectory(OutputDirectory);
 
-			if (outputDirectory != null)
+			if (!string.IsNullOrEmpty(outputDirectory))
 			{
 				Directory.CreateDirectory(outputDirectory);
 			}
@@ -195,17 +198,27 @@ Examples:
 			{
 				if (CreateCompilableProjectFlag)
 				{
+					if (outputDirectory == null)
+					{
+						await app.Error.WriteLineAsync("Output directory is required when creating a project.");
+						return 0;
+					}
 					if (InputAssemblyNames.Length == 1)
 					{
-						string projectFileName = Path.Combine(outputDirectory, Path.GetFileNameWithoutExtension(InputAssemblyNames[0]) + ".csproj");
+						string projectFileName = Path.Combine(
+							outputDirectory,
+							Path.GetFileNameWithoutExtension(InputAssemblyNames[0]) + ".csproj");
 						DecompileAsProject(InputAssemblyNames[0], projectFileName);
 						return 0;
 					}
 					var projects = new List<ProjectItem>();
 					foreach (var file in InputAssemblyNames)
 					{
-						string projectFileName = Path.Combine(outputDirectory, Path.GetFileNameWithoutExtension(file), Path.GetFileNameWithoutExtension(file) + ".csproj");
-						Directory.CreateDirectory(Path.GetDirectoryName(projectFileName));
+						string projectFileName = Path.Combine(
+							outputDirectory,
+							Path.GetFileNameWithoutExtension(file),
+							Path.GetFileNameWithoutExtension(file) + ".csproj");
+						Directory.CreateDirectory(Path.GetDirectoryName(projectFileName)!);
 						ProjectId projectId = DecompileAsProject(file, projectFileName);
 						projects.Add(new ProjectItem(projectFileName, projectId.PlatformName, projectId.Guid, projectId.TypeGuid));
 					}
@@ -224,7 +237,7 @@ Examples:
 							ReportExcludedTypes = ReportExcludedTypes,
 							JsonOnly = JsonOnly,
 							XmlDocs = XmlDocs,
-							StrippedNamespaces = StrippedNamespaces
+							StrippedNamespaces = StrippedNamespaces,
 						};
 
 						command.Run();
@@ -245,7 +258,7 @@ Examples:
 			}
 			catch (Exception ex)
 			{
-				app.Error.WriteLine(ex.ToString());
+				await app.Error.WriteLineAsync(ex.ToString());
 				return ProgramExitCodes.EX_SOFTWARE;
 			}
 			finally
@@ -255,7 +268,7 @@ Examples:
 				if (null != updateCheckTask)
 				{
 					var checkResult = await updateCheckTask;
-					if (null != checkResult && checkResult.UpdateRecommendation)
+					if (checkResult is { UpdateRecommendation: true })
 					{
 						Console.WriteLine("You are not using the latest version of the tool, please update.");
 						Console.WriteLine($"Latest version is '{checkResult.LatestVersion}' (yours is '{checkResult.RunningVersion}')");
@@ -265,7 +278,7 @@ Examples:
 
 			int PerformPerFileAction(string fileName)
 			{
-				if (EntityTypes.Any())
+				if (EntityTypes.Length != 0)
 				{
 					var values = EntityTypes.SelectMany(v => v.Split(',', ';')).ToArray();
 					HashSet<TypeKind> kinds = TypesParser.ParseSelection(values);
@@ -289,7 +302,7 @@ Examples:
 				}
 				else if (CreateDebugInfoFlag)
 				{
-					string pdbFileName = null;
+					string pdbFileName;
 					if (outputDirectory != null)
 					{
 						string outputName = Path.GetFileNameWithoutExtension(fileName);
@@ -320,7 +333,7 @@ Examples:
 			}
 		}
 
-		private static string ResolveOutputDirectory(string outputDirectory)
+		static string ResolveOutputDirectory(string outputDirectory)
 		{
 			// path is not set
 			if (string.IsNullOrWhiteSpace(outputDirectory))
@@ -408,16 +421,16 @@ Examples:
 		{
 			var module = new PEFile(assemblyFileName);
 			var resolver = new UniversalAssemblyResolver(assemblyFileName, false, module.Metadata.DetectTargetFrameworkId());
-			foreach (var path in (ReferencePaths ?? Array.Empty<string>()))
+			foreach (var path in (ReferencePaths ?? []))
 			{
 				resolver.AddSearchDirectory(path);
 			}
 			return new CSharpDecompiler(assemblyFileName, resolver, GetSettings(module)) {
-				DebugInfoProvider = TryLoadPDB(module)
+				DebugInfoProvider = TryLoadPDB(module),
 			};
 		}
 
-		int ListContent(string assemblyFileName, TextWriter output, ISet<TypeKind> kinds)
+		int ListContent(string assemblyFileName, TextWriter output, HashSet<TypeKind> kinds)
 		{
 			CSharpDecompiler decompiler = GetDecompiler(assemblyFileName);
 
@@ -491,69 +504,61 @@ Examples:
 				return ProgramExitCodes.EX_DATAERR;
 			}
 
-			using (FileStream stream = new FileStream(pdbFileName, FileMode.OpenOrCreate, FileAccess.Write))
-			{
-				var decompiler = GetDecompiler(assemblyFileName);
-				PortablePdbWriter.WritePdb(module, decompiler, GetSettings(module), stream);
-			}
+			using FileStream stream = new FileStream(pdbFileName, FileMode.OpenOrCreate, FileAccess.Write);
+			var decompiler = GetDecompiler(assemblyFileName);
+			PortablePdbWriter.WritePdb(module, decompiler, GetSettings(module), stream);
 
 			return 0;
 		}
 
-		int DumpPackageAssemblies(string packageFileName, string outputDirectory, CommandLineApplication app)
+		static int DumpPackageAssemblies(string packageFileName, string outputDirectory, CommandLineApplication app)
 		{
-			using (var memoryMappedPackage = MemoryMappedFile.CreateFromFile(packageFileName, FileMode.Open, null, 0, MemoryMappedFileAccess.Read))
+			using var memoryMappedPackage = MemoryMappedFile.CreateFromFile(packageFileName, FileMode.Open, null, 0, MemoryMappedFileAccess.Read);
+			using var packageView = memoryMappedPackage.CreateViewAccessor(0, 0, MemoryMappedFileAccess.Read);
+			if (!SingleFileBundle.IsBundle(packageView, out long bundleHeaderOffset))
 			{
-				using (var packageView = memoryMappedPackage.CreateViewAccessor(0, 0, MemoryMappedFileAccess.Read))
+				app.Error.WriteLine($"Cannot dump assemblies for {packageFileName}, because it is not a single file bundle.");
+				return ProgramExitCodes.EX_DATAERR;
+			}
+
+			var manifest = SingleFileBundle.ReadManifest(packageView, bundleHeaderOffset);
+			foreach (var entry in manifest.Entries)
+			{
+				Stream contents;
+
+				if (entry.RelativePath.Replace('\\', '/').Contains("../", StringComparison.Ordinal) || Path.IsPathRooted(entry.RelativePath))
 				{
-					if (!SingleFileBundle.IsBundle(packageView, out long bundleHeaderOffset))
+					app.Error.WriteLine($"Skipping single-file entry '{entry.RelativePath}' because it might refer to a location outside of the bundle output directory.");
+					continue;
+				}
+
+				if (entry.CompressedSize == 0)
+				{
+					contents = new UnmanagedMemoryStream(packageView.SafeMemoryMappedViewHandle, entry.Offset, entry.Size);
+				}
+				else
+				{
+					var compressedStream = new UnmanagedMemoryStream(packageView.SafeMemoryMappedViewHandle, entry.Offset, entry.CompressedSize);
+					var decompressedStream = new MemoryStream((int)entry.Size);
+					using (var deflateStream = new DeflateStream(compressedStream, CompressionMode.Decompress))
 					{
-						app.Error.WriteLine($"Cannot dump assembiles for {packageFileName}, because it is not a single file bundle.");
+						deflateStream.CopyTo(decompressedStream);
+					}
+
+					if (decompressedStream.Length != entry.Size)
+					{
+						app.Error.WriteLine($"Corrupted single-file entry '{entry.RelativePath}'. Declared decompressed size '{entry.Size}' is not the same as actual decompressed size '{decompressedStream.Length}'.");
 						return ProgramExitCodes.EX_DATAERR;
 					}
 
-					var manifest = SingleFileBundle.ReadManifest(packageView, bundleHeaderOffset);
-					foreach (var entry in manifest.Entries)
-					{
-						Stream contents;
-
-						if (entry.RelativePath.Replace('\\', '/').Contains("../", StringComparison.Ordinal) || Path.IsPathRooted(entry.RelativePath))
-						{
-							app.Error.WriteLine($"Skipping single-file entry '{entry.RelativePath}' because it might refer to a location outside of the bundle output directory.");
-							continue;
-						}
-
-						if (entry.CompressedSize == 0)
-						{
-							contents = new UnmanagedMemoryStream(packageView.SafeMemoryMappedViewHandle, entry.Offset, entry.Size);
-						}
-						else
-						{
-							Stream compressedStream = new UnmanagedMemoryStream(packageView.SafeMemoryMappedViewHandle, entry.Offset, entry.CompressedSize);
-							Stream decompressedStream = new MemoryStream((int)entry.Size);
-							using (var deflateStream = new DeflateStream(compressedStream, CompressionMode.Decompress))
-							{
-								deflateStream.CopyTo(decompressedStream);
-							}
-
-							if (decompressedStream.Length != entry.Size)
-							{
-								app.Error.WriteLine($"Corrupted single-file entry '{entry.RelativePath}'. Declared decompressed size '{entry.Size}' is not the same as actual decompressed size '{decompressedStream.Length}'.");
-								return ProgramExitCodes.EX_DATAERR;
-							}
-
-							decompressedStream.Seek(0, SeekOrigin.Begin);
-							contents = decompressedStream;
-						}
-
-						string target = Path.Combine(outputDirectory, entry.RelativePath);
-						Directory.CreateDirectory(Path.GetDirectoryName(target));
-						using (var fileStream = File.Create(target))
-						{
-							contents.CopyTo(fileStream);
-						}
-					}
+					decompressedStream.Seek(0, SeekOrigin.Begin);
+					contents = decompressedStream;
 				}
+
+				string target = Path.Combine(outputDirectory, entry.RelativePath);
+				Directory.CreateDirectory(Path.GetDirectoryName(target)!);
+				using var fileStream = File.Create(target);
+				contents.CopyTo(fileStream);
 			}
 
 			return 0;
