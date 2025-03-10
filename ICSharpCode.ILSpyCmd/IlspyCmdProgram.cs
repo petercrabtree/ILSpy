@@ -85,8 +85,8 @@ Examples:
 			CommandOptionType.SingleValue)]
 		public string OutputDirectory { get; }
 
-		[Option("-p|--project",
-			"Decompile assembly as compilable project. This requires the output directory option.",
+	[Option("-p|--project",
+			"Decompile assembly as compilable project. Requires the output directory option.",
 			CommandOptionType.NoValue)]
 		public bool CreateCompilableProjectFlag { get; }
 
@@ -155,7 +155,9 @@ Examples:
 			CommandOptionType.NoValue)]
 		public bool DumpPackageFlag { get; }
 
-		[Option("--nested-directories", "Use nested directories for namespaces.", CommandOptionType.NoValue)]
+		[Option("--nested-directories",
+			"Use nested directories for namespaces.",
+			CommandOptionType.NoValue)]
 		public bool NestedDirectories { get; }
 
 		[Option("--disable-updatecheck",
@@ -242,8 +244,8 @@ Examples:
 				{
 					if (outputDirectory == null)
 					{
-						await app.Error.WriteLineAsync("Output directory is required when creating a project.");
-						return 0;
+						await app.Error.WriteLineAsync("Output directory (-o) must be specified when creating a project (-p).");
+						return ProgramExitCodes.EX_USAGE;
 					}
 
 					if (InputAssemblyNames.Length == 1)
@@ -251,26 +253,11 @@ Examples:
 						string projectFileName = Path.Combine(
 							outputDirectory,
 							Path.GetFileNameWithoutExtension(InputAssemblyNames[0]) + ".csproj");
-						DecompileAsProject(InputAssemblyNames[0], projectFileName);
+						DecompileAsProject(InputAssemblyNames[0], projectFileName, GetSettings(), ReferencePaths, InputPDBFile);
 						return 0;
 					}
 
-					var projects = new List<ProjectItem>();
-					foreach (var file in InputAssemblyNames)
-					{
-						string projectFileName = Path.Combine(
-							outputDirectory,
-							Path.GetFileNameWithoutExtension(file),
-							Path.GetFileNameWithoutExtension(file) + ".csproj");
-						Directory.CreateDirectory(Path.GetDirectoryName(projectFileName)!);
-						ProjectId projectId = DecompileAsProject(file, projectFileName);
-						projects.Add(new ProjectItem(projectFileName, projectId.PlatformName, projectId.Guid,
-							projectId.TypeGuid));
-					}
-
-					SolutionCreator.WriteSolutionFile(
-						Path.Combine(outputDirectory, Path.GetFileNameWithoutExtension(outputDirectory) + ".sln"),
-						projects);
+					DecompileAsSolution(outputDirectory, InputAssemblyNames, GetSettings(), ReferencePaths, InputPDBFile);
 				}
 				else if (GenerateDiagrammer)
 				{
@@ -365,7 +352,7 @@ Examples:
 						pdbFileName = Path.ChangeExtension(fileName, ".pdb");
 					}
 
-					return GeneratePdbForAssembly(fileName, pdbFileName, app);
+					return GeneratePdbForAssembly(fileName, pdbFileName, app, settings: GetSettings(), ReferencePaths, InputPDBFile);
 				}
 
 				if (DumpPackageFlag)
@@ -376,11 +363,12 @@ Examples:
 				if (outputDirectory != null)
 				{
 					string outputName = Path.GetFileNameWithoutExtension(fileName);
-					output = File.CreateText(Path.Combine(outputDirectory,
-						(string.IsNullOrEmpty(TypeName) ? outputName : TypeName) + ".decompiled.cs"));
+					var outputFileName = Path.Combine(outputDirectory,
+						(string.IsNullOrEmpty(TypeName) ? outputName : TypeName) + ".decompiled.cs");
+					output = File.CreateText(outputFileName);
 				}
 
-				return Decompile(fileName, output, TypeName);
+				return Decompile(fileName, output, GetSettings(), ReferencePaths, TypeName, InputPDBFile);
 			}
 		}
 
@@ -394,7 +382,7 @@ Examples:
 				: Path.GetFullPath(outputDirectory);
 		}
 
-		DecompilerSettings GetSettings(PEFile module)
+		DecompilerSettings GetSettings()
 		{
 			DecompilerSettings decompilerSettings = null;
 
@@ -466,26 +454,41 @@ Examples:
 			}
 
 			return decompilerSettings;
+			return new DecompilerSettings(LanguageVersion) {
+				ThrowOnAssemblyResolveErrors = false,
+				RemoveDeadCode = RemoveDeadCode,
+				RemoveDeadStores = RemoveDeadStores,
+				UseSdkStyleProjectFormat = WholeProjectDecompiler.CanUseSdkStyleProjectFormat(module),
+				UseNestedDirectoriesForNamespaces = NestedDirectories,
+			};
 		}
 
-		CSharpDecompiler GetDecompiler(string assemblyFileName)
+		static DecompilerSettings UpdateSettings(DecompilerSettings settings, MetadataFile module)
+		{
+			settings.UseSdkStyleProjectFormat = WholeProjectDecompiler.CanUseSdkStyleProjectFormat(module);
+			return settings;
+		}
+
+		static CSharpDecompiler GetDecompiler(DecompilerSettings settings, string assemblyFileName, string[] referencePaths, (bool IsSet, string Value) inputPDBFile)
 		{
 			var module = new PEFile(assemblyFileName);
-			var resolver =
-				new UniversalAssemblyResolver(assemblyFileName, false, module.Metadata.DetectTargetFrameworkId());
-			foreach (var path in ReferencePaths ?? [])
+			var resolver = new UniversalAssemblyResolver(
+				assemblyFileName,
+				false,
+				module.Metadata.DetectTargetFrameworkId());
+			foreach (var path in referencePaths ?? [])
 			{
 				resolver.AddSearchDirectory(path);
 			}
 
-			return new CSharpDecompiler(assemblyFileName, resolver, GetSettings(module)) {
-				DebugInfoProvider = TryLoadPDB(module),
+			return new CSharpDecompiler(assemblyFileName, resolver, UpdateSettings(settings, module)) {
+				DebugInfoProvider = TryLoadPDB(module, inputPDBFile),
 			};
 		}
 
 		int ListContent(string assemblyFileName, TextWriter output, HashSet<TypeKind> kinds)
 		{
-			CSharpDecompiler decompiler = GetDecompiler(assemblyFileName);
+			CSharpDecompiler decompiler = GetDecompiler(GetSettings(), assemblyFileName, ReferencePaths, InputPDBFile);
 
 			foreach (var type in decompiler.TypeSystem.MainModule.TypeDefinitions)
 			{
@@ -505,32 +508,63 @@ Examples:
 			var module = new PEFile(assemblyFileName);
 			output.WriteLine($"// IL code: {module.Name}");
 			var disassembler = new ReflectionDisassembler(new PlainTextOutput(output), CancellationToken.None) {
-				DebugInfo = TryLoadPDB(module),
+				DebugInfo = TryLoadPDB(module, InputPDBFile),
 				ShowSequencePoints = ShowILSequencePointsFlag,
 			};
 			disassembler.WriteModuleContents(module);
 			return 0;
 		}
+		
+		static void DecompileAsSolution(string outputDirectory, string[] inputAssemblyNames, DecompilerSettings settings, string[] referencePaths, 
+			(bool IsSet, string Value) inputPDBFile)
+		{
+			var projects = new List<ProjectItem>();
+			foreach (var file in inputAssemblyNames)
+			{
+				string projectFileName = Path.Combine(
+					outputDirectory,
+					Path.GetFileNameWithoutExtension(file),
+					Path.GetFileNameWithoutExtension(file) + ".csproj");
+				Directory.CreateDirectory(Path.GetDirectoryName(projectFileName)!);
+				ProjectId projectId = DecompileAsProject(file, projectFileName, settings.Clone(), referencePaths, inputPDBFile);
+				projects.Add(new ProjectItem(
+					projectFileName,
+					projectId.PlatformName,
+					projectId.Guid,
+					projectId.TypeGuid));
+			}
 
-		ProjectId DecompileAsProject(string assemblyFileName, string projectFileName)
+			SolutionCreator.WriteSolutionFile(
+				Path.Combine(outputDirectory, Path.GetFileNameWithoutExtension(outputDirectory) + ".sln"),
+				projects);
+		}
+
+		static ProjectId DecompileAsProject(string assemblyFileName, string projectFileName, DecompilerSettings settings, string[] referencePaths, (bool IsSet, string Value) inputPDBFile)
 		{
 			var module = new PEFile(assemblyFileName);
-			var resolver =
-				new UniversalAssemblyResolver(assemblyFileName, false, module.Metadata.DetectTargetFrameworkId());
-			foreach (var path in ReferencePaths ?? [])
+			var resolver = new UniversalAssemblyResolver(
+				assemblyFileName,
+				false,
+				module.Metadata.DetectTargetFrameworkId());
+			foreach (var path in referencePaths ?? [])
 			{
 				resolver.AddSearchDirectory(path);
 			}
 
-			var decompiler =
-				new WholeProjectDecompiler(GetSettings(module), resolver, null, resolver, TryLoadPDB(module));
+			var decompiler = new WholeProjectDecompiler(
+				UpdateSettings(settings, module),
+				resolver,
+				null,
+				resolver,
+				TryLoadPDB(module, inputPDBFile));
 			using var projectFileWriter = new StreamWriter(File.OpenWrite(projectFileName));
 			return decompiler.DecompileProject(module, Path.GetDirectoryName(projectFileName), projectFileWriter);
 		}
 
-		int Decompile(string assemblyFileName, TextWriter output, string typeName = null)
+		static int Decompile(string assemblyFileName, TextWriter output, DecompilerSettings settings,
+			string[] referencePaths, string typeName, (bool IsSet, string Value) inputPDBFile)
 		{
-			CSharpDecompiler decompiler = GetDecompiler(assemblyFileName);
+			CSharpDecompiler decompiler = GetDecompiler(settings, assemblyFileName, referencePaths, inputPDBFile);
 
 			if (typeName == null)
 			{
@@ -545,7 +579,13 @@ Examples:
 			return 0;
 		}
 
-		int GeneratePdbForAssembly(string assemblyFileName, string pdbFileName, CommandLineApplication app)
+		static int GeneratePdbForAssembly(
+			string assemblyFileName, 
+			string pdbFileName, 
+			CommandLineApplication app, 
+			DecompilerSettings settings, 
+			string[] referencePaths, 
+			(bool IsSet, string Value) inputPDBFile)
 		{
 			var module = new PEFile(assemblyFileName,
 				new FileStream(assemblyFileName, FileMode.Open, FileAccess.Read),
@@ -561,16 +601,20 @@ Examples:
 			}
 
 			using FileStream stream = new FileStream(pdbFileName, FileMode.OpenOrCreate, FileAccess.Write);
-			var decompiler = GetDecompiler(assemblyFileName);
-			PortablePdbWriter.WritePdb(module, decompiler, GetSettings(module), stream);
+			var decompiler = GetDecompiler(settings, assemblyFileName, referencePaths, inputPDBFile);
+			PortablePdbWriter.WritePdb(module, decompiler, UpdateSettings(settings, module), stream);
 
 			return 0;
 		}
 
 		static int DumpPackageAssemblies(string packageFileName, string outputDirectory, CommandLineApplication app)
 		{
-			using var memoryMappedPackage =
-				MemoryMappedFile.CreateFromFile(packageFileName, FileMode.Open, null, 0, MemoryMappedFileAccess.Read);
+			using var memoryMappedPackage = MemoryMappedFile.CreateFromFile(
+				packageFileName, 
+				FileMode.Open, 
+				null, 
+				0, 
+				MemoryMappedFileAccess.Read);
 			using var packageView = memoryMappedPackage.CreateViewAccessor(0, 0, MemoryMappedFileAccess.Read);
 			if (!SingleFileBundle.IsBundle(packageView, out long bundleHeaderOffset))
 			{
@@ -595,13 +639,17 @@ Examples:
 
 				if (entry.CompressedSize == 0)
 				{
-					contents = new UnmanagedMemoryStream(packageView.SafeMemoryMappedViewHandle, entry.Offset,
+					contents = new UnmanagedMemoryStream(
+						packageView.SafeMemoryMappedViewHandle,
+						entry.Offset,
 						entry.Size);
 				}
 				else
 				{
-					var compressedStream = new UnmanagedMemoryStream(packageView.SafeMemoryMappedViewHandle,
-						entry.Offset, entry.CompressedSize);
+					var compressedStream = new UnmanagedMemoryStream(
+						packageView.SafeMemoryMappedViewHandle,
+						entry.Offset,
+						entry.CompressedSize);
 					var decompressedStream = new MemoryStream((int)entry.Size);
 					using (var deflateStream = new DeflateStream(compressedStream, CompressionMode.Decompress))
 					{
@@ -630,16 +678,16 @@ Examples:
 			return 0;
 		}
 
-		IDebugInfoProvider TryLoadPDB(PEFile module)
+		static IDebugInfoProvider TryLoadPDB(PEFile module, (bool IsSet, string Value) inputPDBFile)
 		{
-			if (!InputPDBFile.IsSet)
+			if (!inputPDBFile.IsSet)
 			{
 				return null;
 			}
 
-			return InputPDBFile.Value == null
+			return inputPDBFile.Value == null
 				? DebugInfoUtils.LoadSymbols(module)
-				: DebugInfoUtils.FromFile(module, InputPDBFile.Value);
+				: DebugInfoUtils.FromFile(module, inputPDBFile.Value);
 		}
 	}
 }
