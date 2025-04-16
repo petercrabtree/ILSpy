@@ -129,10 +129,8 @@ Examples:
 			CommandOptionType.SingleOrNoValue)]
 		public (bool IsSet, string Value) InputPDBFile { get; }
 
-		[Option("-l|--list <entity-type(s)>", "Lists all entities of the specified type(s). Valid types: c(lass), i(nterface), s(truct), d(elegate), e(num)", CommandOptionType.MultipleValue)]
 		[Option("-l|--list <entity-type(s)>",
-			"Lists all entities of the specified type(s). " +
-				"Valid types: c(lass), i(nterface), s(truct), d(elegate), e(num)",
+			"Lists all entities of the specified type(s). Valid types: c(lass), i(nterface), s(truct), d(elegate), e(num)",
 			CommandOptionType.MultipleValue)]
 		public string[] EntityTypes { get; } = [];
 
@@ -543,20 +541,19 @@ Examples:
 					new TaskDescriptionColumn(),
 					new ProgressBarColumn(),
 					new PercentageColumn(),
-					new SpinnerColumn());
+					new SpinnerColumn(),
+					new ElapsedTimeColumn());
 			await progressDisplay.StartAsync(async ctx => {
 				ctx.Refresh();
 				// one main task to show the overall progress
 				var projectTrackingTask = ctx.AddTask("Overall Project Progress",
 					new ProgressTaskSettings { AutoStart = false, MaxValue = inputAssemblyNames.Length });
+				projectTrackingTask.StartTask();
 				// pre-generate the tasks for deterministic order
 				var taskPairs = inputAssemblyNames.Select(name => {
 					var task = ctx.AddTask(name, new ProgressTaskSettings {
 						AutoStart = false,
-						// we don't have any progress info yet, just starting and stopping times, so:
-						MaxValue = 1,
 					});
-					// and:
 					task.IsIndeterminate = true;
 					return (
 						name,
@@ -574,19 +571,65 @@ Examples:
 					new ParallelOptions { MaxDegreeOfParallelism = maxDegreeOfParallelism },
 					async (projectContext, token) => {
 						var progress = new Progress<DecompilationProgress>(value => {
+							// this callback must be thread-safe, as it will be called from the threadpool
+							// (or whatever SynchronizationContext is in play)
+							//
+							// so we must lock an object to ensure this callback is serialized
+							// the task object is a fine object to lock on
 							var task = projectContext.task;
-							if (value.TotalUnits > 0)
+							lock (task)
 							{
-								task.MaxValue = value.TotalUnits;
-								task.Value = value.UnitsCompleted;
-								task.IsIndeterminate = false;
-							}
-							if (!string.IsNullOrWhiteSpace(value.Status))
-							{
-								task.Description = $"{projectContext.name}: {value.Status}";
+								// we can avoid the task object doing wasteful locking
+								// (which doesn't matter a lot, but this callback can get called a lot)
+								if (value.TotalUnits <= 0)
+								{
+									if (!task.IsIndeterminate) // avoid lock
+									{
+										task.IsIndeterminate = true;
+									}
+								}
+								else
+								{
+									var fractionDoneBefore = task.MaxValue == 0 ? 0 : task.Value / task.MaxValue;
+									double? _fractionDoneNow = value.TotalUnits == 0 ? null : (double)value.UnitsCompleted / value.TotalUnits;
+									var fractionDoneNow = _fractionDoneNow.Value;
+									// clamp to 0-1 in case of bad progress reporting:
+									fractionDoneNow = Math.Max(0, Math.Min(1, fractionDoneNow));
+									fractionDoneBefore = Math.Max(0, Math.Min(1, fractionDoneBefore));
+									if (task.IsIndeterminate) // avoid lock
+									{
+										task.IsIndeterminate = false;
+									}
+									if (task.MaxValue != value.TotalUnits) // etc
+									{
+										task.MaxValue = value.TotalUnits;
+									}
+									if (task.Value != value.UnitsCompleted) // etc
+									{
+										task.Value = value.UnitsCompleted;
+									}
+									if (fractionDoneNow > fractionDoneBefore)
+									{
+										// A subtle thread-safety point: we only ever *increase* the overall progress, never decrease it
+										// because while it generally won't be the case that progress callbacks are called out of order,
+										// there's no guarantee
+										// 
+										// However, by only ever increasing, we can't process them out of order,
+										// (assuming TotalUnits is non-increasing and UnitsCompleted is non-decreasing)
+										// and thus we can incrementally update the overall progress without recalculating anything
+										// or doing any expensive serialization
+
+										// this isn't numerically stable (each project will likely add a tiny bit more or less than exactly 1 unit of progress),
+										// but a double should have plenty of precision to be close enough and this is simple and very fast
+
+										// update overall progress
+										projectTrackingTask.Increment(fractionDoneNow - fractionDoneBefore);
+									}
+								}
 							}
 						});
 						await DecompileProjectAsync(projectContext, token, progress);
+						projectContext.task.StopTask();
 					});
 
 				var solutionTask = ctx.AddTask("Writing Solution File & Fixing Project References", new ProgressTaskSettings { MaxValue = 1 });
@@ -632,9 +675,7 @@ Examples:
 				projectId.Guid,
 				projectId.TypeGuid));
 
-			progressTask.Increment(1);
 			progressTask.StopTask(); // remove from the progress display
-			projectTrackingTask.Increment(1);
 		}
 
 		static ProjectId DecompileAsProject(
@@ -643,7 +684,7 @@ Examples:
 			DecompilerSettings settings,
 			string[] referencePaths,
 			(bool IsSet, string Value) inputPDBFile,
-			IProgress<DecompilationProgress> progress)
+			IProgress<DecompilationProgress> progress = null)
 		{
 			string projectFileName = Path.Combine(
 				outputDirectory,
@@ -668,11 +709,13 @@ Examples:
 				TryLoadPDB(module, inputPDBFile));
 
 			using var projectFileWriter = new StreamWriter(File.OpenWrite(projectFileName));
-			return decompiler.DecompileProject(
+			decompiler.ProgressIndicator = progress;
+			var result = decompiler.DecompileProject(
 				module,
 				Path.GetDirectoryName(projectFileName),
-				projectFileWriter,
-				progress);
+				projectFileWriter);
+			decompiler.ProgressIndicator = null;
+			return result;
 		}
 
 		static int Decompile(
