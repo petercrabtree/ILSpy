@@ -172,6 +172,8 @@ namespace ICSharpCode.Decompiler.Solution
 							$"no <Project> at the root; could not fix project references.");
 					}
 
+					// sdk style projects don't use a namespace for the elements,
+					// but we still need to use the namespace for non-sdk style projects.
 					var sdkStyle = projectDoc.Root.Attribute("Sdk") != null;
 					var itemGroupTagName = sdkStyle ? "ItemGroup" : NonSDKProjectFileNamespace + "ItemGroup";
 					var referenceTagName = sdkStyle ? "Reference" : NonSDKProjectFileNamespace + "Reference";
