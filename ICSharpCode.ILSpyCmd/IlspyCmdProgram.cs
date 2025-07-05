@@ -530,8 +530,7 @@ Examples:
 				.Progress()
 				.AutoRefresh(true)
 				.AutoClear(false)
-				.HideCompleted(projects.Count >
-							   40) // could be way too many tasks to show all, 40 seems like a reasonable cutoff
+				.HideCompleted(projects.Count > 40) // could be way too many tasks to show all, 40 seems like a reasonable cutoff
 				.Columns(
 					new TaskDescriptionColumn(),
 					new ProgressBarColumn(),
@@ -565,7 +564,22 @@ Examples:
 				await Parallel.ForEachAsync(
 					taskPairs,
 					new ParallelOptions { MaxDegreeOfParallelism = maxDegreeOfParallelism },
-					DecompileProjectAsync);
+					async (projectContext, token) => {
+						var progress = new Progress<DecompilationProgress>(value => {
+							var task = projectContext.task;
+							if (value.TotalUnits > 0)
+							{
+								task.MaxValue = value.TotalUnits;
+								task.Value = value.UnitsCompleted;
+								task.IsIndeterminate = false;
+							}
+							if (!string.IsNullOrWhiteSpace(value.Status))
+							{
+								task.Description = $"{projectContext.name}: {value.Status}";
+							}
+						});
+						await DecompileProjectAsync(projectContext, token, progress);
+					});
 
 				var solutionTask = ctx.AddTask("Writing Solution File & Fixing Project References", new ProgressTaskSettings { MaxValue = 1 });
 
@@ -582,7 +596,8 @@ Examples:
 		}
 		static async ValueTask DecompileProjectAsync(
 				(string name, ProgressTask task, DecompilerSettings settings, string[] referencePaths, (bool IsSet, string Value) inputPDBFile, ConcurrentBag<ProjectItem> projects, string outputDirectory, ProgressTask projectTrackingTask) projectContext,
-				CancellationToken token)
+				CancellationToken token,
+				IProgress<DecompilationProgress> progress)
 		{
 			var (file, progressTask, settings, referencePaths, inputPDBFile, projects, outputDirectory, projectTrackingTask) = projectContext;
 			// add to the project display
@@ -594,13 +609,13 @@ Examples:
 			Directory.CreateDirectory(projectDirectory);
 			string projectFileName = Path.Combine(projectDirectory, $"{fileBaseName}.csproj");
 
-			// todo: make a version that takes an IProgress<T> and use that here
 			var projectId = DecompileAsProject(
 				file,
 				projectDirectory,
 				settings.Clone(), // each project decompilation sets UseSdkStyleProjectFormat, so avoid sharing state between threads
 				referencePaths,
-				inputPDBFile);
+				inputPDBFile,
+				progress);
 
 			// projects is a ConcurrentBag, so it's thread-safe
 			projects.Add(new ProjectItem(
@@ -619,7 +634,8 @@ Examples:
 			string outputDirectory,
 			DecompilerSettings settings,
 			string[] referencePaths,
-			(bool IsSet, string Value) inputPDBFile)
+			(bool IsSet, string Value) inputPDBFile,
+			IProgress<DecompilationProgress> progress = null)
 		{
 			try
 			{
@@ -648,7 +664,8 @@ Examples:
 				return decompiler.DecompileProject(
 					module,
 					Path.GetDirectoryName(projectFileName),
-					projectFileWriter);
+					projectFileWriter,
+					progress);
 			}
 			catch (Exception ex)
 			{
