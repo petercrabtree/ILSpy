@@ -1,4 +1,5 @@
 using System;
+using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.ComponentModel.DataAnnotations;
 using System.IO;
@@ -45,6 +46,11 @@ Examples:
     Decompile assembly to destination directory, create a project file, one source file per type.
         ilspycmd -p -o c:\decompiled sample.dll
 
+    Decompile multiple assemblies into a single solution, using all available cores.
+        ilspycmd -p -o c:\decompiled -j 0 sample.dll sample2.dll sample3.dll sample4.dll
+		(or with max of 2 parallel jobs)
+        ilspycmd -p -o c:\decompiled -j 2 sample.dll sample2.dll sample3.dll sample4.dll
+
     Decompile assembly to destination directory, create a project file, one source file per type, 
     into nicely nested directories.
         ilspycmd --nested-directories -p -o c:\decompiled sample.dll
@@ -89,6 +95,12 @@ Examples:
 				"Decompile assembly as compilable project. Requires the output directory option.",
 				CommandOptionType.NoValue)]
 		public bool CreateCompilableProjectFlag { get; }
+
+		[Option("-j|--jobs",
+			"Sets the maximum number of parallel jobs for project decompilation. " +
+			"Pass 0 to use Environment.ProcessorCount (the logical processor count sans cpus not available to this process).",
+			CommandOptionType.SingleValue)]
+		public int Jobs { get; } = 1;
 
 		[Option("-t|--type <type-name>",
 			"The fully qualified name of the type to decompile.",
@@ -164,7 +176,6 @@ Examples:
 			"If using ilspycmd in a tight loop or fully automated scenario, you might want to disable the automatic update check.",
 			CommandOptionType.NoValue)]
 		public bool DisableUpdateCheck { get; }
-
 		#region MermaidDiagrammer options
 
 		// reused or quoted commands
@@ -286,7 +297,7 @@ Examples:
 					return 0;
 				}
 
-				DecompileAsSolution(outputDirectory, InputAssemblyNames, GetSettings(), ReferencePaths, InputPDBFile);
+				DecompileAsSolution(outputDirectory, InputAssemblyNames, GetSettings(), ReferencePaths, InputPDBFile, Jobs);
 			}
 			else if (GenerateDiagrammer)
 			{
@@ -459,7 +470,11 @@ Examples:
 			};
 		}
 
-		static CSharpDecompiler GetDecompiler(DecompilerSettings settings, string assemblyFileName, string[] referencePaths, (bool IsSet, string Value) inputPDBFile)
+		static CSharpDecompiler GetDecompiler(
+			DecompilerSettings settings,
+			string assemblyFileName,
+			string[] referencePaths,
+			(bool IsSet, string Value) inputPDBFile)
 		{
 			var module = new PEFile(assemblyFileName);
 			var resolver = new UniversalAssemblyResolver(
@@ -506,31 +521,52 @@ Examples:
 			return 0;
 		}
 
-		static void DecompileAsSolution(string outputDirectory, string[] inputAssemblyNames, DecompilerSettings settings, string[] referencePaths,
-			(bool IsSet, string Value) inputPDBFile)
+		static void DecompileAsSolution(
+				string outputDirectory,
+				string[] inputAssemblyNames,
+				DecompilerSettings settings,
+				string[] referencePaths,
+				(bool IsSet, string Value) inputPDBFile,
+				int maxDegreeOfParallelism)
 		{
-			var projects = new List<ProjectItem>();
-			foreach (var file in inputAssemblyNames)
-			{
-				string projectFileName = Path.Combine(
-					outputDirectory,
-					Path.GetFileNameWithoutExtension(file),
-					Path.GetFileNameWithoutExtension(file) + ".csproj");
-				Directory.CreateDirectory(Path.GetDirectoryName(projectFileName)!);
-				ProjectId projectId = DecompileAsProject(file, projectFileName, settings.Clone(), referencePaths, inputPDBFile);
-				projects.Add(new ProjectItem(
-					projectFileName,
-					projectId.PlatformName,
-					projectId.Guid,
-					projectId.TypeGuid));
-			}
+			var projects = new ConcurrentBag<ProjectItem>();
+
+			maxDegreeOfParallelism = maxDegreeOfParallelism <= 0 ? Environment.ProcessorCount : maxDegreeOfParallelism;
+
+			Parallel.ForEach(
+				inputAssemblyNames,
+				new ParallelOptions { MaxDegreeOfParallelism = maxDegreeOfParallelism },
+				file => {
+					var fileBaseName = Path.GetFileNameWithoutExtension(file);
+					var projectDirectory = Path.Combine(outputDirectory, fileBaseName);
+					Directory.CreateDirectory(projectDirectory);
+					string projectFileName = Path.Combine(projectDirectory, $"{fileBaseName}.csproj");
+
+					var projectId = DecompileAsProject(
+						file,
+						projectDirectory,
+						settings.Clone(),
+						referencePaths,
+						inputPDBFile);
+
+					projects.Add(new ProjectItem(
+						projectFileName,
+						projectId.PlatformName,
+						projectId.Guid,
+						projectId.TypeGuid));
+				});
 
 			SolutionCreator.WriteSolutionFile(
 				Path.Combine(outputDirectory, Path.GetFileNameWithoutExtension(outputDirectory) + ".sln"),
 				projects);
 		}
 
-		static ProjectId DecompileAsProject(string assemblyFileName, string outputDirectory, DecompilerSettings settings, string[] referencePaths, (bool IsSet, string Value) inputPDBFile)
+		static ProjectId DecompileAsProject(
+			string assemblyFileName,
+			string outputDirectory,
+			DecompilerSettings settings,
+			string[] referencePaths,
+			(bool IsSet, string Value) inputPDBFile)
 		{
 			string projectFileName = Path.Combine(
 				outputDirectory,
@@ -553,12 +589,21 @@ Examples:
 				null,
 				resolver,
 				TryLoadPDB(module, inputPDBFile));
+
 			using var projectFileWriter = new StreamWriter(File.OpenWrite(projectFileName));
-			return decompiler.DecompileProject(module, Path.GetDirectoryName(projectFileName), projectFileWriter);
+			return decompiler.DecompileProject(
+				module,
+				Path.GetDirectoryName(projectFileName),
+				projectFileWriter);
 		}
 
-		static int Decompile(string assemblyFileName, TextWriter output, DecompilerSettings settings,
-			string[] referencePaths, string typeName, (bool IsSet, string Value) inputPDBFile)
+		static int Decompile(
+			string assemblyFileName,
+			TextWriter output,
+			DecompilerSettings settings,
+			string[] referencePaths,
+			string typeName,
+			(bool IsSet, string Value) inputPDBFile)
 		{
 			CSharpDecompiler decompiler = GetDecompiler(settings, assemblyFileName, referencePaths, inputPDBFile);
 
