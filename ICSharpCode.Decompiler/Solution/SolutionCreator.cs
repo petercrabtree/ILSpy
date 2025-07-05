@@ -161,32 +161,38 @@ namespace ICSharpCode.Decompiler.Solution
 
 			foreach (var project in projects)
 			{
-				XDocument projectDoc = XDocument.Load(project.FilePath);
-
-				if (projectDoc.Root?.Name.LocalName != "Project")
+				try
 				{
-					throw new InvalidOperationException(
-						$"The file {project.FilePath} is not a valid project file, " +
-						$"no <Project> at the root; could not fix project references.");
+					XDocument projectDoc = XDocument.Load(project.FilePath);
+
+					if (projectDoc.Root?.Name.LocalName != "Project")
+					{
+						throw new InvalidOperationException(
+							$"The file {project.FilePath} is not a valid project file, " +
+							$"no <Project> at the root; could not fix project references.");
+					}
+
+					var sdkStyle = projectDoc.Root.Attribute("Sdk") != null;
+					var itemGroupTagName = sdkStyle ? "ItemGroup" : NonSDKProjectFileNamespace + "ItemGroup";
+					var referenceTagName = sdkStyle ? "Reference" : NonSDKProjectFileNamespace + "Reference";
+
+					var referencesItemGroups = projectDoc.Root
+						.Elements(itemGroupTagName)
+						.Where(e => e.Elements(referenceTagName).Any())
+						.ToList();
+
+					foreach (var itemGroup in referencesItemGroups)
+					{
+						FixProjectReferences(project.FilePath, itemGroup, projectsMap, sdkStyle);
+					}
+
+					projectDoc.Save(project.FilePath);
 				}
-
-				// sdk style projects don't use a namespace for the elements,
-				// but we still need to use the namespace for non-sdk style projects.
-				var sdkStyle = projectDoc.Root.Attribute("Sdk") != null;
-				var itemGroupTagName = sdkStyle ? "ItemGroup" : NonSDKProjectFileNamespace + "ItemGroup";
-				var referenceTagName = sdkStyle ? "Reference" : NonSDKProjectFileNamespace + "Reference";
-
-				var referencesItemGroups = projectDoc.Root
-					.Elements(itemGroupTagName)
-					.Where(e => e.Elements(referenceTagName).Any())
-					.ToList();
-
-				foreach (var itemGroup in referencesItemGroups)
+				catch (Exception ex)
 				{
-					FixProjectReferences(project.FilePath, itemGroup, projectsMap, sdkStyle);
+					throw new Exception(
+						$"Failed to fix project references in {project.FilePath}.", ex);
 				}
-
-				projectDoc.Save(project.FilePath);
 			}
 		}
 

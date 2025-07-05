@@ -9,6 +9,7 @@ using System.Linq;
 using System.Reflection.Metadata;
 using System.Reflection.PortableExecutable;
 using System.Threading;
+using System.Threading.Channels;
 using System.Threading.Tasks;
 
 using ICSharpCode.Decompiler;
@@ -25,6 +26,8 @@ using ICSharpCode.ILSpyX.PdbProvider;
 using McMaster.Extensions.CommandLineUtils;
 
 using Microsoft.Extensions.Hosting;
+
+using Spectre.Console;
 
 // ReSharper disable UnassignedGetOnlyAutoProperty
 
@@ -48,8 +51,8 @@ Examples:
 
     Decompile multiple assemblies into a single solution, using all available cores.
         ilspycmd -p -o c:\decompiled -j 0 sample.dll sample2.dll sample3.dll sample4.dll
-		(or with max of 2 parallel jobs)
-        ilspycmd -p -o c:\decompiled -j 2 sample.dll sample2.dll sample3.dll sample4.dll
+		(or with max of 4 parallel jobs)
+        ilspycmd -p -o c:\decompiled -j 4 s1.dll s2.dll s3.dll s4.dll s5.dll s6.dll s7.dll s8.dll
 
     Decompile assembly to destination directory, create a project file, one source file per type, 
     into nicely nested directories.
@@ -295,8 +298,7 @@ Examples:
 					DecompileAsProject(InputAssemblyNames[0], outputDirectory, GetSettings(), ReferencePaths, InputPDBFile);
 					return 0;
 				}
-
-				DecompileAsSolution(outputDirectory, InputAssemblyNames, GetSettings(), ReferencePaths, InputPDBFile, Jobs);
+				await DecompileAsSolutionAsync(outputDirectory, InputAssemblyNames, GetSettings(), ReferencePaths, InputPDBFile, Jobs);
 			}
 			else if (GenerateDiagrammer)
 			{
@@ -509,11 +511,12 @@ Examples:
 				DebugInfo = TryLoadPDB(module, InputPDBFile),
 				ShowSequencePoints = ShowILSequencePointsFlag,
 			};
+
 			disassembler.WriteModuleContents(module);
 			return 0;
 		}
 
-		static void DecompileAsSolution(
+		static async Task DecompileAsSolutionAsync(
 				string outputDirectory,
 				string[] inputAssemblyNames,
 				DecompilerSettings settings,
@@ -522,35 +525,93 @@ Examples:
 				int maxDegreeOfParallelism)
 		{
 			var projects = new ConcurrentBag<ProjectItem>();
-
 			maxDegreeOfParallelism = maxDegreeOfParallelism <= 0 ? Environment.ProcessorCount : maxDegreeOfParallelism;
-
-			Parallel.ForEach(
-				inputAssemblyNames,
-				new ParallelOptions { MaxDegreeOfParallelism = maxDegreeOfParallelism },
-				file => {
-					var fileBaseName = Path.GetFileNameWithoutExtension(file);
-					var projectDirectory = Path.Combine(outputDirectory, fileBaseName);
-					Directory.CreateDirectory(projectDirectory);
-					string projectFileName = Path.Combine(projectDirectory, $"{fileBaseName}.csproj");
-
-					var projectId = DecompileAsProject(
-						file,
-						projectDirectory,
-						settings.Clone(), // each project decompilation sets UseSdkStyleProjectFormat, so avoid sharing state between threads
+			var progressDisplay = AnsiConsole
+				.Progress()
+				.AutoRefresh(true)
+				.AutoClear(false)
+				.HideCompleted(projects.Count >
+							   40) // could be way too many tasks to show all, 40 seems like a reasonable cutoff
+				.Columns(
+					new TaskDescriptionColumn(),
+					new ProgressBarColumn(),
+					new PercentageColumn(),
+					new SpinnerColumn());
+			await progressDisplay.StartAsync(async ctx => {
+				ctx.Refresh();
+				// one main task to show the overall progress
+				var projectTrackingTask = ctx.AddTask("Overall Project Progress",
+					new ProgressTaskSettings { AutoStart = false, MaxValue = inputAssemblyNames.Length });
+				// pre-generate the tasks for deterministic order
+				var taskPairs = inputAssemblyNames.Select(name => {
+					var task = ctx.AddTask(name, new ProgressTaskSettings {
+						AutoStart = false,
+						// we don't have any progress info yet, just starting and stopping times, so:
+						MaxValue = 1,
+					});
+					// and:
+					task.IsIndeterminate = true;
+					return (
+						name,
+						task,
+						settings,
 						referencePaths,
-						inputPDBFile);
+						inputPDBFile,
+						projects,
+						outputDirectory,
+						projectTrackingTask
+					);
+				}).ToList();
+				await Parallel.ForEachAsync(
+					taskPairs,
+					new ParallelOptions { MaxDegreeOfParallelism = maxDegreeOfParallelism },
+					DecompileProjectAsync);
 
-					projects.Add(new ProjectItem(
-						projectFileName,
-						projectId.PlatformName,
-						projectId.Guid,
-						projectId.TypeGuid));
-				});
+				var solutionTask = ctx.AddTask("Writing Solution File & Fixing Project References", new ProgressTaskSettings { MaxValue = 1 });
 
-			SolutionCreator.WriteSolutionFile(
-				Path.Combine(outputDirectory, Path.GetFileNameWithoutExtension(outputDirectory) + ".sln"),
-				[.. projects]);
+				SolutionCreator.WriteSolutionFile(
+					Path.Combine(outputDirectory, Path.GetFileNameWithoutExtension(outputDirectory) + ".sln"),
+					projects.OrderBy(p => p.ProjectName).ToList());
+
+				solutionTask.Increment(1);
+				solutionTask.StopTask();
+
+				// order by project name for (more) deterministic output
+				// (plus it's probably what other tools do for maximum compatibility)
+			});
+		}
+		static async ValueTask DecompileProjectAsync(
+				(string name, ProgressTask task, DecompilerSettings settings, string[] referencePaths, (bool IsSet, string Value) inputPDBFile, ConcurrentBag<ProjectItem> projects, string outputDirectory, ProgressTask projectTrackingTask) projectContext,
+				CancellationToken token)
+		{
+			var (file, progressTask, settings, referencePaths, inputPDBFile, projects, outputDirectory, projectTrackingTask) = projectContext;
+			// add to the project display
+			progressTask.StartTask();
+
+			// ensure the directory and extract the base name
+			var fileBaseName = Path.GetFileNameWithoutExtension(file);
+			var projectDirectory = Path.Combine(outputDirectory, fileBaseName);
+			Directory.CreateDirectory(projectDirectory);
+			string projectFileName = Path.Combine(projectDirectory, $"{fileBaseName}.csproj");
+
+			// todo: make a version that takes an IProgress<T> and use that here
+			var projectId = DecompileAsProject(
+				file,
+				projectDirectory,
+				settings.Clone(), // each project decompilation sets UseSdkStyleProjectFormat, so avoid sharing state between threads
+				referencePaths,
+				inputPDBFile);
+
+			// projects is a ConcurrentBag, so it's thread-safe
+			projects.Add(new ProjectItem(
+				projectFileName,
+				projectId.PlatformName,
+				projectId.Guid,
+				projectId.TypeGuid));
+
+			progressTask.Increment(1);
+			progressTask.StopTask(); // remove from the progress display
+			projectTrackingTask.Increment(1);
 		}
 
 		static ProjectId DecompileAsProject(
