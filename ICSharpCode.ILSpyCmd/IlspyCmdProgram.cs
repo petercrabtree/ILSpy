@@ -1,4 +1,5 @@
 using System;
+using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.ComponentModel.DataAnnotations;
 using System.IO;
@@ -8,6 +9,7 @@ using System.Linq;
 using System.Reflection.Metadata;
 using System.Reflection.PortableExecutable;
 using System.Threading;
+using System.Threading.Channels;
 using System.Threading.Tasks;
 
 using ICSharpCode.Decompiler;
@@ -25,9 +27,14 @@ using McMaster.Extensions.CommandLineUtils;
 
 using Microsoft.Extensions.Hosting;
 
+using Spectre.Console;
+
+// ReSharper disable UnassignedGetOnlyAutoProperty
+
 namespace ICSharpCode.ILSpyCmd
 {
-	[Command(Name = "ilspycmd", Description = "dotnet tool for decompiling .NET assemblies and generating portable PDBs",
+	[Command(Name = "ilspycmd",
+		Description = "dotnet tool for decompiling .NET assemblies and generating portable PDBs",
 		ExtendedHelpText = @"
 Remarks:
   -o is valid with every option and required when using -p.
@@ -42,6 +49,11 @@ Examples:
     Decompile assembly to destination directory, create a project file, one source file per type.
         ilspycmd -p -o c:\decompiled sample.dll
 
+    Decompile multiple assemblies into a single solution, using all available cores.
+        ilspycmd -p -o c:\decompiled -j 0 sample.dll sample2.dll sample3.dll sample4.dll
+		(or with max of 4 parallel jobs)
+        ilspycmd -p -o c:\decompiled -j 4 s1.dll s2.dll s3.dll s4.dll s5.dll s6.dll s7.dll s8.dll
+
     Decompile assembly to destination directory, create a project file, one source file per type, 
     into nicely nested directories.
         ilspycmd --nested-directories -p -o c:\decompiled sample.dll
@@ -55,50 +67,79 @@ Examples:
 ")]
 	[HelpOption("-h|--help")]
 	[ProjectOptionRequiresOutputDirectoryValidation]
-	[VersionOptionFromMember("-v|--version", Description = "Show version of ICSharpCode.Decompiler used.",
+	[VersionOptionFromMember("-v|--version",
+		Description = "Show version of ICSharpCode.Decompiler used.",
 		MemberName = nameof(DecompilerVersion))]
-	class ILSpyCmdProgram
+	// we don't actually use env, but this is the method sig expected by the host
+#pragma warning disable CS9113 // Parameter is unread.
+	class ILSpyCmdProgram(IHostEnvironment env)
+#pragma warning restore CS9113 // Parameter is unread.
 	{
+		// ReSharper disable MemberCanBePrivate.Global
 		// https://natemcmaster.github.io/CommandLineUtils/docs/advanced/generic-host.html
 		// https://github.com/natemcmaster/CommandLineUtils/blob/main/docs/samples/dependency-injection/generic-host/Program.cs
-		public static Task<int> Main(string[] args) => new HostBuilder().RunCommandLineApplicationAsync<ILSpyCmdProgram>(args);
+		public static Task<int> Main(string[] args)
+		{
+			return new HostBuilder().RunCommandLineApplicationAsync<ILSpyCmdProgram>(args);
+		}
 
 		[FilesExist]
 		[Required]
-		[Argument(0, "Assembly file name(s)", "The list of assemblies that is being decompiled. This argument is mandatory.")]
+		[Argument(0, "Assembly file name(s)",
+			"The list of assemblies that is being decompiled. This argument is mandatory.")]
 		public string[] InputAssemblyNames { get; }
 
-		[Option("-o|--outputdir <directory>", "The output directory, if omitted decompiler output is written to standard out.", CommandOptionType.SingleValue)]
+		[Option("-o|--outputdir <directory>",
+			"The output directory, if omitted decompiler output is written to standard out.",
+			CommandOptionType.SingleValue)]
 		public string OutputDirectory { get; }
 
-		[Option("-p|--project", "Decompile assembly as compilable project. This requires the output directory option.", CommandOptionType.NoValue)]
+		[Option("-p|--project",
+				"Decompile assembly as compilable project. Requires the output directory option.",
+				CommandOptionType.NoValue)]
 		public bool CreateCompilableProjectFlag { get; }
 
-		[Option("-t|--type <type-name>", "The fully qualified name of the type to decompile.", CommandOptionType.SingleValue)]
+		[Option("-j|--jobs",
+			"Sets the maximum number of parallel jobs for project decompilation. " +
+			"Pass 0 to use Environment.ProcessorCount (the logical processor count sans cpus not available to this process).",
+			CommandOptionType.SingleValue)]
+		public int Jobs { get; } = 1;
+
+		[Option("-t|--type <type-name>",
+			"The fully qualified name of the type to decompile.",
+			CommandOptionType.SingleValue)]
 		public string TypeName { get; }
 
 		[Option("-il|--ilcode", "Show IL code.", CommandOptionType.NoValue)]
 		public bool ShowILCodeFlag { get; }
 
-		[Option("--il-sequence-points", "Show IL with sequence points. Implies -il.", CommandOptionType.NoValue)]
+		[Option("--il-sequence-points",
+			"Show IL with sequence points. Implies -il.",
+			CommandOptionType.NoValue)]
 		public bool ShowILSequencePointsFlag { get; }
 
-		[Option("-genpdb|--generate-pdb", "Generate PDB.", CommandOptionType.NoValue)]
+		[Option("-genpdb|--generate-pdb",
+			"Generate PDB.",
+			CommandOptionType.NoValue)]
 		public bool CreateDebugInfoFlag { get; }
 
 		[FileExistsOrNull]
-		[Option("-usepdb|--use-varnames-from-pdb", "Use variable names from PDB.", CommandOptionType.SingleOrNoValue)]
+		[Option("-usepdb|--use-varnames-from-pdb",
+			"Use variable names from PDB.",
+			CommandOptionType.SingleOrNoValue)]
 		public (bool IsSet, string Value) InputPDBFile { get; }
 
-		[Option("-l|--list <entity-type(s)>", "Lists all entities of the specified type(s). Valid types: c(lass), i(nterface), s(truct), d(elegate), e(num)", CommandOptionType.MultipleValue)]
-		public string[] EntityTypes { get; } = Array.Empty<string>();
+		[Option("-l|--list <entity-type(s)>",
+			"Lists all entities of the specified type(s). Valid types: c(lass), i(nterface), s(truct), d(elegate), e(num)",
+			CommandOptionType.MultipleValue)]
+		public string[] EntityTypes { get; } = [];
 
-		public string DecompilerVersion => "ilspycmd: " + typeof(ILSpyCmdProgram).Assembly.GetName().Version.ToString() +
-				Environment.NewLine
-				+ "ICSharpCode.Decompiler: " +
-				typeof(FullTypeName).Assembly.GetName().Version.ToString();
+		public static string DecompilerVersion =>
+			$"ilspycmd: {typeof(ILSpyCmdProgram).Assembly.GetName().Version}{Environment.NewLine}" +
+			$"ICSharpCode.Decompiler: {typeof(FullTypeName).Assembly.GetName().Version}";
 
-		[Option("-lv|--languageversion <version>", "C# Language version: CSharp1, CSharp2, CSharp3, " +
+		[Option("-lv|--languageversion <version>",
+			"C# Language version: CSharp1, CSharp2, CSharp3, " +
 			"CSharp4, CSharp5, CSharp6, CSharp7, CSharp7_1, CSharp7_2, CSharp7_3, CSharp8_0, CSharp9_0, " +
 			"CSharp10_0, CSharp11_0, CSharp12_0, CSharp13_0, Preview or Latest", CommandOptionType.SingleValue)]
 		public LanguageVersion LanguageVersion { get; } = LanguageVersion.Latest;
@@ -111,7 +152,9 @@ Examples:
 		public string[] DecompilerSettingOverrides { get; set; } = Array.Empty<string>();
 
 		[DirectoryExists]
-		[Option("-r|--referencepath <path>", "Path to a directory containing dependencies of the assembly that is being decompiled.", CommandOptionType.MultipleValue)]
+		[Option("-r|--referencepath <path>",
+			"Path to a directory containing dependencies of the assembly that is being decompiled.",
+			CommandOptionType.MultipleValue)]
 		public string[] ReferencePaths { get; }
 
 		[Option("--no-dead-code", "Remove dead code.", CommandOptionType.NoValue)]
@@ -120,132 +163,105 @@ Examples:
 		[Option("--no-dead-stores", "Remove dead stores.", CommandOptionType.NoValue)]
 		public bool RemoveDeadStores { get; }
 
-		[Option("-d|--dump-package", "Dump package assemblies into a folder. This requires the output directory option.", CommandOptionType.NoValue)]
+		[Option("-d|--dump-package",
+			"Dump package assemblies into a folder. This requires the output directory option.",
+			CommandOptionType.NoValue)]
 		public bool DumpPackageFlag { get; }
 
-		[Option("--nested-directories", "Use nested directories for namespaces.", CommandOptionType.NoValue)]
+		[Option("--nested-directories",
+			"Use nested directories for namespaces.",
+			CommandOptionType.NoValue)]
 		public bool NestedDirectories { get; }
 
-		[Option("--disable-updatecheck", "If using ilspycmd in a tight loop or fully automated scenario, you might want to disable the automatic update check.", CommandOptionType.NoValue)]
+		[Option("--disable-updatecheck",
+			"If using ilspycmd in a tight loop or fully automated scenario, you might want to disable the automatic update check.",
+			CommandOptionType.NoValue)]
 		public bool DisableUpdateCheck { get; }
-
 		#region MermaidDiagrammer options
 
 		// reused or quoted commands
-		private const string generateDiagrammerCmd = "--generate-diagrammer",
+		const string
+			generateDiagrammerCmd = "--generate-diagrammer",
 			exclude = generateDiagrammerCmd + "-exclude",
 			include = generateDiagrammerCmd + "-include";
 
-		[Option(generateDiagrammerCmd, "Generates an interactive HTML diagrammer app from selected types in the target assembly" +
-			" - to the --outputdir or in a 'diagrammer' folder next to to the assembly by default.", CommandOptionType.NoValue)]
+		[Option(generateDiagrammerCmd,
+			"Generates an interactive HTML diagrammer app from selected types in the target assembly" +
+			" - to the --outputdir or in a 'diagrammer' folder next to to the assembly by default.",
+			CommandOptionType.NoValue)]
 		public bool GenerateDiagrammer { get; }
 
-		[Option(include, "An optional regular expression matching Type.FullName used to whitelist types to include in the generated diagrammer.", CommandOptionType.SingleValue)]
-		public string Include { get; set; }
+		[Option(include,
+			"An optional regular expression matching Type.FullName used to whitelist types to include in the generated diagrammer.",
+			CommandOptionType.SingleValue)]
+		public string Include { get; }
 
-		[Option(exclude, "An optional regular expression matching Type.FullName used to blacklist types to exclude from the generated diagrammer.", CommandOptionType.SingleValue)]
-		public string Exclude { get; set; }
+		[Option(exclude,
+			"An optional regular expression matching Type.FullName used to blacklist types to exclude from the generated diagrammer.",
+			CommandOptionType.SingleValue)]
+		public string Exclude { get; }
 
-		[Option(generateDiagrammerCmd + "-report-excluded", "Outputs a report of types excluded from the generated diagrammer" +
+		[Option(generateDiagrammerCmd + "-report-excluded",
+			"Outputs a report of types excluded from the generated diagrammer" +
 			$" - whether by default because compiler-generated, explicitly by '{exclude}' or implicitly by '{include}'." +
 			" You may find this useful to develop and debug your regular expressions.", CommandOptionType.NoValue)]
-		public bool ReportExcludedTypes { get; set; }
+		public bool ReportExcludedTypes { get; }
 
-		[Option(generateDiagrammerCmd + "-docs", "The path or file:// URI of the XML file containing the target assembly's documentation comments." +
-			" You only need to set this if a) you want your diagrams annotated with them and b) the file name differs from that of the assmbly." +
-			" To enable XML documentation output for your assmbly, see https://learn.microsoft.com/en-us/dotnet/csharp/language-reference/xmldoc/#create-xml-documentation-output",
+		[Option(generateDiagrammerCmd + "-docs",
+			"The path or file:// URI of the XML file containing the target assembly's documentation comments." +
+			" You only need to set this if a) you want your diagrams annotated with them and b) the file name differs from that of the assembly." +
+			" To enable XML documentation output for your assembly, see https://learn.microsoft.com/en-us/dotnet/csharp/language-reference/xmldoc/#create-xml-documentation-output",
 			CommandOptionType.SingleValue)]
-		public string XmlDocs { get; set; }
+		public string XmlDocs { get; }
 
 		/// <inheritdoc cref="ILSpyX.MermaidDiagrammer.GenerateHtmlDiagrammer.StrippedNamespaces" />
-		[Option(generateDiagrammerCmd + "-strip-namespaces", "Optional space-separated namespace names that are removed for brevity from XML documentation comments." +
-			" Note that the order matters: e.g. replace 'System.Collections' before 'System' to remove both of them completely.", CommandOptionType.MultipleValue)]
-		public string[] StrippedNamespaces { get; set; }
+		[Option(generateDiagrammerCmd + "-strip-namespaces",
+			"Optional space-separated namespace names that are removed for brevity from XML documentation comments." +
+			" Note that the order matters: e.g. replace 'System.Collections' before 'System' to remove both of them completely.",
+			CommandOptionType.MultipleValue)]
+		public string[] StrippedNamespaces { get; }
 
 		[Option(generateDiagrammerCmd + "-json-only",
 			"Whether to generate a model.json file instead of baking it into the HTML template." +
 			" This is useful for the HTML/JS/CSS development loop.", CommandOptionType.NoValue,
-			ShowInHelpText = false)] // developer option, output is really only useful in combination with the corresponding task in html/gulpfile.js
-		public bool JsonOnly { get; set; }
+			ShowInHelpText =
+				false)] // developer option, output is really only useful in combination with the corresponding task in html/gulpfile.js
+		public bool JsonOnly { get; }
+
 		#endregion
 
-		private readonly IHostEnvironment _env;
-		public ILSpyCmdProgram(IHostEnvironment env)
+		// ReSharper restore MemberCanBePrivate.Global
+		// ReSharper disable once UnusedMember.Local
+		async Task<int> OnExecuteAsync(CommandLineApplication app)
 		{
-			_env = env;
-		}
-
-		private async Task<int> OnExecuteAsync(CommandLineApplication app)
-		{
+			// common logic for operations
 			Task<PackageCheckResult> updateCheckTask = null;
 			if (!DisableUpdateCheck)
 			{
 				updateCheckTask = DotNetToolUpdateChecker.CheckForPackageUpdateAsync("ilspycmd");
 			}
 
-			TextWriter output = System.Console.Out;
-			string outputDirectory = ResolveOutputDirectory(OutputDirectory);
+			TextWriter output = app.Out;
+			string outputDirectory = string.IsNullOrWhiteSpace(OutputDirectory)
+				// path is not set
+				? null
+				// resolve relative path, backreferences ('.' and '..') and other
+				// platform-specific path elements, like '~'.
+				: Path.GetFullPath(OutputDirectory);
 
-			if (outputDirectory != null)
+			if (!string.IsNullOrEmpty(outputDirectory))
 			{
 				Directory.CreateDirectory(outputDirectory);
 			}
 
+			// validate args and dispatch to specific operation
 			try
 			{
-				if (CreateCompilableProjectFlag)
-				{
-					if (InputAssemblyNames.Length == 1)
-					{
-						string projectFileName = Path.Combine(outputDirectory, Path.GetFileNameWithoutExtension(InputAssemblyNames[0]) + ".csproj");
-						DecompileAsProject(InputAssemblyNames[0], projectFileName);
-						return 0;
-					}
-					var projects = new List<ProjectItem>();
-					foreach (var file in InputAssemblyNames)
-					{
-						string projectFileName = Path.Combine(outputDirectory, Path.GetFileNameWithoutExtension(file), Path.GetFileNameWithoutExtension(file) + ".csproj");
-						Directory.CreateDirectory(Path.GetDirectoryName(projectFileName));
-						ProjectId projectId = DecompileAsProject(file, projectFileName);
-						projects.Add(new ProjectItem(projectFileName, projectId.PlatformName, projectId.Guid, projectId.TypeGuid));
-					}
-					SolutionCreator.WriteSolutionFile(Path.Combine(outputDirectory, Path.GetFileNameWithoutExtension(outputDirectory) + ".sln"), projects);
-					return 0;
-				}
-				else if (GenerateDiagrammer)
-				{
-					foreach (var file in InputAssemblyNames)
-					{
-						var command = new GenerateHtmlDiagrammer {
-							Assembly = file,
-							OutputFolder = OutputDirectory,
-							Include = Include,
-							Exclude = Exclude,
-							ReportExcludedTypes = ReportExcludedTypes,
-							JsonOnly = JsonOnly,
-							XmlDocs = XmlDocs,
-							StrippedNamespaces = StrippedNamespaces
-						};
-
-						command.Run();
-					}
-
-					return 0;
-				}
-				else
-				{
-					foreach (var file in InputAssemblyNames)
-					{
-						int result = PerformPerFileAction(file);
-						if (result != 0)
-							return result;
-					}
-					return 0;
-				}
+				return await RunAsync(app, outputDirectory, output);
 			}
 			catch (Exception ex)
 			{
-				app.Error.WriteLine(ex.ToString());
+				await app.Error.WriteLineAsync(ex.ToString());
 				return ProgramExitCodes.EX_SOFTWARE;
 			}
 			finally
@@ -255,82 +271,125 @@ Examples:
 				if (null != updateCheckTask)
 				{
 					var checkResult = await updateCheckTask;
-					if (null != checkResult && checkResult.UpdateRecommendation)
+					if (checkResult is { UpdateRecommendation: true })
 					{
 						Console.WriteLine("You are not using the latest version of the tool, please update.");
-						Console.WriteLine($"Latest version is '{checkResult.LatestVersion}' (yours is '{checkResult.RunningVersion}')");
+						Console.WriteLine(
+							$"Latest version is '{checkResult.LatestVersion}' " +
+							$"(yours is '{checkResult.RunningVersion}')");
+					}
+				}
+			}
+		}
+
+		async Task<int> RunAsync(CommandLineApplication app, string outputDirectory, TextWriter output)
+		{
+			if (CreateCompilableProjectFlag)
+			{
+				if (outputDirectory == null)
+				{
+					await app.Error.WriteLineAsync("Output directory (-o) must be specified when creating a project (-p).");
+					return ProgramExitCodes.EX_USAGE;
+				}
+
+				if (InputAssemblyNames.Length == 1)
+				{
+					DecompileAsProject(InputAssemblyNames[0], outputDirectory, GetSettings(), ReferencePaths, InputPDBFile);
+					return 0;
+				}
+				await DecompileAsSolutionAsync(outputDirectory, InputAssemblyNames, GetSettings(), ReferencePaths, InputPDBFile, Jobs);
+			}
+			else if (GenerateDiagrammer)
+			{
+				foreach (var file in InputAssemblyNames)
+				{
+					var command = new GenerateHtmlDiagrammer {
+						Assembly = file,
+						OutputFolder = OutputDirectory,
+						Include = Include,
+						Exclude = Exclude,
+						ReportExcludedTypes = ReportExcludedTypes,
+						JsonOnly = JsonOnly,
+						XmlDocs = XmlDocs,
+						StrippedNamespaces = StrippedNamespaces,
+					};
+
+					command.Run();
+				}
+			}
+			else
+			{
+				foreach (var file in InputAssemblyNames)
+				{
+					int result = PerformPerFileAction(file, output, outputDirectory, app);
+					if (result != 0)
+					{
+						return result;
 					}
 				}
 			}
 
-			int PerformPerFileAction(string fileName)
+			return 0;
+		}
+		int PerformPerFileAction(string fileName, TextWriter output, string outputDirectory, CommandLineApplication app)
+		{
+			if (EntityTypes.Length != 0)
 			{
-				if (EntityTypes.Any())
+				var values = EntityTypes.SelectMany(v => v.Split(',', ';')).ToArray();
+				HashSet<TypeKind> kinds = TypesParser.ParseSelection(values);
+				if (outputDirectory != null)
 				{
-					var values = EntityTypes.SelectMany(v => v.Split(',', ';')).ToArray();
-					HashSet<TypeKind> kinds = TypesParser.ParseSelection(values);
-					if (outputDirectory != null)
-					{
-						string outputName = Path.GetFileNameWithoutExtension(fileName);
-						output = File.CreateText(Path.Combine(outputDirectory, outputName) + ".list.txt");
-					}
-
-					return ListContent(fileName, output, kinds);
+					string outputName = Path.GetFileNameWithoutExtension(fileName);
+					output = File.CreateText(Path.Combine(outputDirectory, outputName) + ".list.txt");
 				}
-				else if (ShowILCodeFlag || ShowILSequencePointsFlag)
-				{
-					if (outputDirectory != null)
-					{
-						string outputName = Path.GetFileNameWithoutExtension(fileName);
-						output = File.CreateText(Path.Combine(outputDirectory, outputName) + ".il");
-					}
 
-					return ShowIL(fileName, output);
-				}
-				else if (CreateDebugInfoFlag)
-				{
-					string pdbFileName = null;
-					if (outputDirectory != null)
-					{
-						string outputName = Path.GetFileNameWithoutExtension(fileName);
-						pdbFileName = Path.Combine(outputDirectory, outputName) + ".pdb";
-					}
-					else
-					{
-						pdbFileName = Path.ChangeExtension(fileName, ".pdb");
-					}
+				return ListContent(fileName, output, kinds);
+			}
 
-					return GeneratePdbForAssembly(fileName, pdbFileName, app);
-				}
-				else if (DumpPackageFlag)
+			if (ShowILCodeFlag || ShowILSequencePointsFlag)
+			{
+				if (outputDirectory != null)
 				{
-					return DumpPackageAssemblies(fileName, outputDirectory, app);
+					string outputName = Path.GetFileNameWithoutExtension(fileName);
+					output = File.CreateText(Path.Combine(outputDirectory, outputName) + ".il");
+				}
+
+				return ShowIL(fileName, output);
+			}
+
+			if (CreateDebugInfoFlag)
+			{
+				string pdbFileName;
+				if (outputDirectory != null)
+				{
+					string outputName = Path.GetFileNameWithoutExtension(fileName);
+					pdbFileName = Path.Combine(outputDirectory, outputName) + ".pdb";
 				}
 				else
 				{
-					if (outputDirectory != null)
-					{
-						string outputName = Path.GetFileNameWithoutExtension(fileName);
-						output = File.CreateText(Path.Combine(outputDirectory,
-							(string.IsNullOrEmpty(TypeName) ? outputName : TypeName) + ".decompiled.cs"));
-					}
-
-					return Decompile(fileName, output, TypeName);
+					pdbFileName = Path.ChangeExtension(fileName, ".pdb");
 				}
+
+				return GeneratePdbForAssembly(fileName, pdbFileName, app, settings: GetSettings(), ReferencePaths, InputPDBFile);
 			}
+
+			if (DumpPackageFlag)
+			{
+				return DumpPackageAssemblies(fileName, outputDirectory, app);
+			}
+
+			if (outputDirectory != null)
+			{
+				string outputName = Path.GetFileNameWithoutExtension(fileName);
+				var outputFileName = Path.Combine(outputDirectory,
+					(string.IsNullOrEmpty(TypeName) ? outputName : TypeName) + ".decompiled.cs");
+				output = File.CreateText(outputFileName);
+			}
+
+			return Decompile(fileName, output, GetSettings(), ReferencePaths, TypeName, InputPDBFile);
 		}
 
-		private static string ResolveOutputDirectory(string outputDirectory)
-		{
-			// path is not set
-			if (string.IsNullOrWhiteSpace(outputDirectory))
-				return null;
-			// resolve relative path, backreferences ('.' and '..') and other
-			// platform-specific path elements, like '~'.
-			return Path.GetFullPath(outputDirectory);
-		}
-
-		DecompilerSettings GetSettings(PEFile module)
+		DecompilerSettings GetSettings()
 		{
 			DecompilerSettings decompilerSettings = null;
 
@@ -402,31 +461,51 @@ Examples:
 			}
 
 			return decompilerSettings;
-		}
-
-		CSharpDecompiler GetDecompiler(string assemblyFileName)
-		{
-			var module = new PEFile(assemblyFileName);
-			var resolver = new UniversalAssemblyResolver(assemblyFileName, false, module.Metadata.DetectTargetFrameworkId());
-			foreach (var path in (ReferencePaths ?? Array.Empty<string>()))
-			{
-				resolver.AddSearchDirectory(path);
-			}
-			return new CSharpDecompiler(assemblyFileName, resolver, GetSettings(module)) {
-				DebugInfoProvider = TryLoadPDB(module)
+			return new DecompilerSettings(LanguageVersion) {
+				ThrowOnAssemblyResolveErrors = false,
+				RemoveDeadCode = RemoveDeadCode,
+				RemoveDeadStores = RemoveDeadStores,
+				UseSdkStyleProjectFormat = WholeProjectDecompiler.CanUseSdkStyleProjectFormat(module),
+				UseNestedDirectoriesForNamespaces = NestedDirectories,
 			};
 		}
 
-		int ListContent(string assemblyFileName, TextWriter output, ISet<TypeKind> kinds)
+		static CSharpDecompiler GetDecompiler(
+			DecompilerSettings settings,
+			string assemblyFileName,
+			string[] referencePaths,
+			(bool IsSet, string Value) inputPDBFile)
 		{
-			CSharpDecompiler decompiler = GetDecompiler(assemblyFileName);
+			var module = new PEFile(assemblyFileName);
+			var resolver = new UniversalAssemblyResolver(
+				assemblyFileName,
+				false,
+				module.Metadata.DetectTargetFrameworkId());
+			foreach (var path in referencePaths ?? [])
+			{
+				resolver.AddSearchDirectory(path);
+			}
+
+			settings.UseSdkStyleProjectFormat = WholeProjectDecompiler.CanUseSdkStyleProjectFormat(module);
+			return new CSharpDecompiler(assemblyFileName, resolver, settings) {
+				DebugInfoProvider = TryLoadPDB(module, inputPDBFile),
+			};
+		}
+
+		int ListContent(string assemblyFileName, TextWriter output, HashSet<TypeKind> kinds)
+		{
+			CSharpDecompiler decompiler = GetDecompiler(GetSettings(), assemblyFileName, ReferencePaths, InputPDBFile);
 
 			foreach (var type in decompiler.TypeSystem.MainModule.TypeDefinitions)
 			{
 				if (!kinds.Contains(type.Kind))
+				{
 					continue;
+				}
+
 				output.WriteLine($"{type.Kind} {type.FullName}");
 			}
+
 			return 0;
 		}
 
@@ -435,29 +514,219 @@ Examples:
 			var module = new PEFile(assemblyFileName);
 			output.WriteLine($"// IL code: {module.Name}");
 			var disassembler = new ReflectionDisassembler(new PlainTextOutput(output), CancellationToken.None) {
-				DebugInfo = TryLoadPDB(module),
+				DebugInfo = TryLoadPDB(module, InputPDBFile),
 				ShowSequencePoints = ShowILSequencePointsFlag,
 			};
+
 			disassembler.WriteModuleContents(module);
 			return 0;
 		}
 
-		ProjectId DecompileAsProject(string assemblyFileName, string projectFileName)
+		static async Task DecompileAsSolutionAsync(
+				string outputDirectory,
+				string[] inputAssemblyNames,
+				DecompilerSettings settings,
+				string[] referencePaths,
+				(bool IsSet, string Value) inputPDBFile,
+				int maxDegreeOfParallelism)
 		{
+			var projects = new ConcurrentBag<ProjectItem>();
+			maxDegreeOfParallelism = maxDegreeOfParallelism <= 0 ? Environment.ProcessorCount : maxDegreeOfParallelism;
+			var progressDisplay = AnsiConsole
+				.Progress()
+				.AutoRefresh(true)
+				.AutoClear(false)
+				.HideCompleted(projects.Count > 40) // could be way too many tasks to show all, 40 seems like a reasonable cutoff
+				.Columns(
+					new TaskDescriptionColumn(),
+					new ProgressBarColumn(),
+					new PercentageColumn(),
+					new SpinnerColumn(),
+					new ElapsedTimeColumn());
+			await progressDisplay.StartAsync(async ctx => {
+				ctx.Refresh();
+				// one main task to show the overall progress
+				var projectTrackingTask = ctx.AddTask("Overall Project Progress",
+					new ProgressTaskSettings { AutoStart = false, MaxValue = inputAssemblyNames.Length });
+				projectTrackingTask.StartTask();
+				// pre-generate the tasks for deterministic order
+				var taskPairs = inputAssemblyNames.Select(name => {
+					var task = ctx.AddTask(name, new ProgressTaskSettings {
+						AutoStart = false,
+					});
+					task.IsIndeterminate = true;
+					return (
+						name,
+						task,
+						settings,
+						referencePaths,
+						inputPDBFile,
+						projects,
+						outputDirectory,
+						projectTrackingTask
+					);
+				}).ToList();
+				await Parallel.ForEachAsync(
+					taskPairs,
+					new ParallelOptions { MaxDegreeOfParallelism = maxDegreeOfParallelism },
+					async (projectContext, token) => {
+						var progress = new Progress<DecompilationProgress>(value => {
+							// this callback must be thread-safe, as it will be called from the threadpool
+							// (or whatever SynchronizationContext is in play)
+							//
+							// so we must lock an object to ensure this callback is serialized
+							// the task object is a fine object to lock on
+							var task = projectContext.task;
+							lock (task)
+							{
+								// we can avoid the task object doing wasteful locking
+								// (which doesn't matter a lot, but this callback can get called a lot)
+								if (value.TotalUnits <= 0)
+								{
+									if (!task.IsIndeterminate) // avoid lock
+									{
+										task.IsIndeterminate = true;
+									}
+								}
+								else
+								{
+									var fractionDoneBefore = task.MaxValue == 0 ? 0 : task.Value / task.MaxValue;
+									double? _fractionDoneNow = value.TotalUnits == 0 ? null : (double)value.UnitsCompleted / value.TotalUnits;
+									var fractionDoneNow = _fractionDoneNow.Value;
+									// clamp to 0-1 in case of bad progress reporting:
+									fractionDoneNow = Math.Max(0, Math.Min(1, fractionDoneNow));
+									fractionDoneBefore = Math.Max(0, Math.Min(1, fractionDoneBefore));
+									if (task.IsIndeterminate) // avoid lock
+									{
+										task.IsIndeterminate = false;
+									}
+									if (task.MaxValue != value.TotalUnits) // etc
+									{
+										task.MaxValue = value.TotalUnits;
+									}
+									if (task.Value != value.UnitsCompleted) // etc
+									{
+										task.Value = value.UnitsCompleted;
+									}
+									if (fractionDoneNow > fractionDoneBefore)
+									{
+										// A subtle thread-safety point: we only ever *increase* the overall progress, never decrease it
+										// because while it generally won't be the case that progress callbacks are called out of order,
+										// there's no guarantee
+										// 
+										// However, by only ever increasing, we can't process them out of order,
+										// (assuming TotalUnits is non-increasing and UnitsCompleted is non-decreasing)
+										// and thus we can incrementally update the overall progress without recalculating anything
+										// or doing any expensive serialization
+
+										// this isn't numerically stable (each project will likely add a tiny bit more or less than exactly 1 unit of progress),
+										// but a double should have plenty of precision to be close enough and this is simple and very fast
+
+										// update overall progress
+										projectTrackingTask.Increment(fractionDoneNow - fractionDoneBefore);
+									}
+								}
+							}
+						});
+						await DecompileProjectAsync(projectContext, token, progress);
+						projectContext.task.StopTask();
+					});
+
+				var solutionTask = ctx.AddTask("Writing Solution File & Fixing Project References", new ProgressTaskSettings { MaxValue = 1 });
+
+				SolutionCreator.WriteSolutionFile(
+					Path.Combine(outputDirectory, Path.GetFileNameWithoutExtension(outputDirectory) + ".sln"),
+					projects.OrderBy(p => p.ProjectName).ToList());
+
+				solutionTask.Increment(1);
+				solutionTask.StopTask();
+
+				// order by project name for (more) deterministic output
+				// (plus it's probably what other tools do for maximum compatibility)
+			});
+		}
+		static async ValueTask DecompileProjectAsync(
+				(string name, ProgressTask task, DecompilerSettings settings, string[] referencePaths, (bool IsSet, string Value) inputPDBFile, ConcurrentBag<ProjectItem> projects, string outputDirectory, ProgressTask projectTrackingTask) projectContext,
+				CancellationToken token,
+				IProgress<DecompilationProgress> progress)
+		{
+			var (file, progressTask, settings, referencePaths, inputPDBFile, projects, outputDirectory, projectTrackingTask) = projectContext;
+			// add to the project display
+			progressTask.StartTask();
+
+			// ensure the directory and extract the base name
+			var fileBaseName = Path.GetFileNameWithoutExtension(file);
+			var projectDirectory = Path.Combine(outputDirectory, fileBaseName);
+			Directory.CreateDirectory(projectDirectory);
+			string projectFileName = Path.Combine(projectDirectory, $"{fileBaseName}.csproj");
+
+			var projectId = DecompileAsProject(
+				file,
+				projectDirectory,
+				settings.Clone(),
+				referencePaths,
+				inputPDBFile,
+				progress);
+
+			// projects is a ConcurrentBag, so it's thread-safe
+			projects.Add(new ProjectItem(
+				projectFileName,
+				projectId.PlatformName,
+				projectId.Guid,
+				projectId.TypeGuid));
+
+			progressTask.StopTask(); // remove from the progress display
+		}
+
+		static ProjectId DecompileAsProject(
+			string assemblyFileName,
+			string outputDirectory,
+			DecompilerSettings settings,
+			string[] referencePaths,
+			(bool IsSet, string Value) inputPDBFile,
+			IProgress<DecompilationProgress> progress = null)
+		{
+			string projectFileName = Path.Combine(
+				outputDirectory,
+				Path.GetFileNameWithoutExtension(assemblyFileName) + ".csproj");
+
 			var module = new PEFile(assemblyFileName);
-			var resolver = new UniversalAssemblyResolver(assemblyFileName, false, module.Metadata.DetectTargetFrameworkId());
-			foreach (var path in (ReferencePaths ?? Array.Empty<string>()))
+			var resolver = new UniversalAssemblyResolver(
+				assemblyFileName,
+				false,
+				module.Metadata.DetectTargetFrameworkId());
+			foreach (var path in referencePaths ?? [])
 			{
 				resolver.AddSearchDirectory(path);
 			}
-			var decompiler = new WholeProjectDecompiler(GetSettings(module), resolver, null, resolver, TryLoadPDB(module));
-			using (var projectFileWriter = new StreamWriter(File.OpenWrite(projectFileName)))
-				return decompiler.DecompileProject(module, Path.GetDirectoryName(projectFileName), projectFileWriter);
+
+			settings.UseSdkStyleProjectFormat = WholeProjectDecompiler.CanUseSdkStyleProjectFormat(module);
+			var decompiler = new WholeProjectDecompiler(
+				settings,
+				resolver,
+				null,
+				resolver,
+				TryLoadPDB(module, inputPDBFile));
+
+			using var projectFileWriter = new StreamWriter(File.OpenWrite(projectFileName));
+			decompiler.ProgressIndicator = progress;
+			var result = decompiler.DecompileProject(
+				module,
+				Path.GetDirectoryName(projectFileName),
+				projectFileWriter);
+			decompiler.ProgressIndicator = null;
+			return result;
 		}
 
-		int Decompile(string assemblyFileName, TextWriter output, string typeName = null)
+		static int Decompile(
+			string assemblyFileName,
+			TextWriter output,
+			DecompilerSettings settings,
+			string[] referencePaths,
+			string typeName,
+			(bool IsSet, string Value) inputPDBFile)
 		{
-			CSharpDecompiler decompiler = GetDecompiler(assemblyFileName);
+			CSharpDecompiler decompiler = GetDecompiler(settings, assemblyFileName, referencePaths, inputPDBFile);
 
 			if (typeName == null)
 			{
@@ -468,100 +737,120 @@ Examples:
 				var name = new FullTypeName(typeName);
 				output.Write(decompiler.DecompileTypeAsString(name));
 			}
+
 			return 0;
 		}
 
-		int GeneratePdbForAssembly(string assemblyFileName, string pdbFileName, CommandLineApplication app)
+		static int GeneratePdbForAssembly(
+			string assemblyFileName,
+			string pdbFileName,
+			CommandLineApplication app,
+			DecompilerSettings settings,
+			string[] referencePaths,
+			(bool IsSet, string Value) inputPDBFile)
 		{
 			var module = new PEFile(assemblyFileName,
 				new FileStream(assemblyFileName, FileMode.Open, FileAccess.Read),
 				PEStreamOptions.PrefetchEntireImage,
-				metadataOptions: MetadataReaderOptions.None);
+				MetadataReaderOptions.None);
 
 			if (!PortablePdbWriter.HasCodeViewDebugDirectoryEntry(module))
 			{
-				app.Error.WriteLine($"Cannot create PDB file for {assemblyFileName}, because it does not contain a PE Debug Directory Entry of type 'CodeView'.");
+				app.Error.WriteLine(
+					$"Cannot create PDB file for {assemblyFileName}, " +
+					$"because it does not contain a PE Debug Directory Entry of type 'CodeView'.");
 				return ProgramExitCodes.EX_DATAERR;
 			}
 
-			using (FileStream stream = new FileStream(pdbFileName, FileMode.OpenOrCreate, FileAccess.Write))
-			{
-				var decompiler = GetDecompiler(assemblyFileName);
-				PortablePdbWriter.WritePdb(module, decompiler, GetSettings(module), stream);
-			}
+			using FileStream stream = new FileStream(pdbFileName, FileMode.OpenOrCreate, FileAccess.Write);
+			var decompiler = GetDecompiler(settings, assemblyFileName, referencePaths, inputPDBFile);
+			settings.UseSdkStyleProjectFormat = WholeProjectDecompiler.CanUseSdkStyleProjectFormat(module);
+			PortablePdbWriter.WritePdb(module, decompiler, settings, stream);
 
 			return 0;
 		}
 
-		int DumpPackageAssemblies(string packageFileName, string outputDirectory, CommandLineApplication app)
+		static int DumpPackageAssemblies(string packageFileName, string outputDirectory, CommandLineApplication app)
 		{
-			using (var memoryMappedPackage = MemoryMappedFile.CreateFromFile(packageFileName, FileMode.Open, null, 0, MemoryMappedFileAccess.Read))
+			using var memoryMappedPackage = MemoryMappedFile.CreateFromFile(
+				packageFileName,
+				FileMode.Open,
+				null,
+				0,
+				MemoryMappedFileAccess.Read);
+			using var packageView = memoryMappedPackage.CreateViewAccessor(0, 0, MemoryMappedFileAccess.Read);
+			if (!SingleFileBundle.IsBundle(packageView, out long bundleHeaderOffset))
 			{
-				using (var packageView = memoryMappedPackage.CreateViewAccessor(0, 0, MemoryMappedFileAccess.Read))
+				app.Error.WriteLine(
+					$"Cannot dump assemblies for {packageFileName}, because it is not a single file bundle.");
+				return ProgramExitCodes.EX_DATAERR;
+			}
+
+			var manifest = SingleFileBundle.ReadManifest(packageView, bundleHeaderOffset);
+			foreach (var entry in manifest.Entries)
+			{
+				Stream contents;
+
+				if (entry.RelativePath.Replace('\\', '/').Contains("../", StringComparison.Ordinal) ||
+					Path.IsPathRooted(entry.RelativePath))
 				{
-					if (!SingleFileBundle.IsBundle(packageView, out long bundleHeaderOffset))
+					app.Error.WriteLine(
+						$"Skipping single-file entry '{entry.RelativePath}' " +
+						$"because it might refer to a location outside of the bundle output directory.");
+					continue;
+				}
+
+				if (entry.CompressedSize == 0)
+				{
+					contents = new UnmanagedMemoryStream(
+						packageView.SafeMemoryMappedViewHandle,
+						entry.Offset,
+						entry.Size);
+				}
+				else
+				{
+					var compressedStream = new UnmanagedMemoryStream(
+						packageView.SafeMemoryMappedViewHandle,
+						entry.Offset,
+						entry.CompressedSize);
+					var decompressedStream = new MemoryStream((int)entry.Size);
+					using (var deflateStream = new DeflateStream(compressedStream, CompressionMode.Decompress))
 					{
-						app.Error.WriteLine($"Cannot dump assembiles for {packageFileName}, because it is not a single file bundle.");
+						deflateStream.CopyTo(decompressedStream);
+					}
+
+					if (decompressedStream.Length != entry.Size)
+					{
+						app.Error.WriteLine(
+							$"Corrupted single-file entry '{entry.RelativePath}'. " +
+							$"Declared decompressed size '{entry.Size}' is not the same as actual decompressed size " +
+							$"'{decompressedStream.Length}'.");
 						return ProgramExitCodes.EX_DATAERR;
 					}
 
-					var manifest = SingleFileBundle.ReadManifest(packageView, bundleHeaderOffset);
-					foreach (var entry in manifest.Entries)
-					{
-						Stream contents;
-
-						if (entry.RelativePath.Replace('\\', '/').Contains("../", StringComparison.Ordinal) || Path.IsPathRooted(entry.RelativePath))
-						{
-							app.Error.WriteLine($"Skipping single-file entry '{entry.RelativePath}' because it might refer to a location outside of the bundle output directory.");
-							continue;
-						}
-
-						if (entry.CompressedSize == 0)
-						{
-							contents = new UnmanagedMemoryStream(packageView.SafeMemoryMappedViewHandle, entry.Offset, entry.Size);
-						}
-						else
-						{
-							Stream compressedStream = new UnmanagedMemoryStream(packageView.SafeMemoryMappedViewHandle, entry.Offset, entry.CompressedSize);
-							Stream decompressedStream = new MemoryStream((int)entry.Size);
-							using (var deflateStream = new DeflateStream(compressedStream, CompressionMode.Decompress))
-							{
-								deflateStream.CopyTo(decompressedStream);
-							}
-
-							if (decompressedStream.Length != entry.Size)
-							{
-								app.Error.WriteLine($"Corrupted single-file entry '{entry.RelativePath}'. Declared decompressed size '{entry.Size}' is not the same as actual decompressed size '{decompressedStream.Length}'.");
-								return ProgramExitCodes.EX_DATAERR;
-							}
-
-							decompressedStream.Seek(0, SeekOrigin.Begin);
-							contents = decompressedStream;
-						}
-
-						string target = Path.Combine(outputDirectory, entry.RelativePath);
-						Directory.CreateDirectory(Path.GetDirectoryName(target));
-						using (var fileStream = File.Create(target))
-						{
-							contents.CopyTo(fileStream);
-						}
-					}
+					decompressedStream.Seek(0, SeekOrigin.Begin);
+					contents = decompressedStream;
 				}
+
+				string target = Path.Combine(outputDirectory, entry.RelativePath);
+				Directory.CreateDirectory(Path.GetDirectoryName(target)!);
+				using var fileStream = File.Create(target);
+				contents.CopyTo(fileStream);
 			}
 
 			return 0;
 		}
 
-		IDebugInfoProvider TryLoadPDB(PEFile module)
+		static IDebugInfoProvider TryLoadPDB(PEFile module, (bool IsSet, string Value) inputPDBFile)
 		{
-			if (InputPDBFile.IsSet)
+			if (!inputPDBFile.IsSet)
 			{
-				if (InputPDBFile.Value == null)
-					return DebugInfoUtils.LoadSymbols(module);
-				return DebugInfoUtils.FromFile(module, InputPDBFile.Value);
+				return null;
 			}
 
-			return null;
+			return inputPDBFile.Value == null
+				? DebugInfoUtils.LoadSymbols(module)
+				: DebugInfoUtils.FromFile(module, inputPDBFile.Value);
 		}
 	}
 }
