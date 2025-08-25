@@ -532,7 +532,7 @@ Examples:
 				.Progress()
 				.AutoRefresh(true)
 				.AutoClear(false)
-				.HideCompleted(projects.Count > 40) // could be way too many tasks to show all, 40 seems like a reasonable cutoff
+				.HideCompleted(inputAssemblyNames.Length > 40) // could be way too many tasks to show all, 40 seems like a reasonable cutoff
 				.Columns(
 					new TaskDescriptionColumn(),
 					new ProgressBarColumn(),
