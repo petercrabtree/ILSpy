@@ -444,15 +444,22 @@ Examples:
 
 		ProjectId DecompileAsProject(string assemblyFileName, string projectFileName)
 		{
-			var module = new PEFile(assemblyFileName);
-			var resolver = new UniversalAssemblyResolver(assemblyFileName, false, module.Metadata.DetectTargetFrameworkId());
-			foreach (var path in (ReferencePaths ?? Array.Empty<string>()))
+			try
 			{
-				resolver.AddSearchDirectory(path);
+				var module = new PEFile(assemblyFileName);
+				var resolver = new UniversalAssemblyResolver(assemblyFileName, false, module.Metadata.DetectTargetFrameworkId());
+				foreach (var path in (ReferencePaths ?? Array.Empty<string>()))
+				{
+					resolver.AddSearchDirectory(path);
+				}
+				var decompiler = new WholeProjectDecompiler(GetSettings(module), resolver, null, resolver, TryLoadPDB(module));
+				using (var projectFileWriter = new StreamWriter(File.OpenWrite(projectFileName)))
+					return decompiler.DecompileProject(module, Path.GetDirectoryName(projectFileName), projectFileWriter);
 			}
-			var decompiler = new WholeProjectDecompiler(GetSettings(module), resolver, null, resolver, TryLoadPDB(module));
-			using (var projectFileWriter = new StreamWriter(File.OpenWrite(projectFileName)))
-				return decompiler.DecompileProject(module, Path.GetDirectoryName(projectFileName), projectFileWriter);
+			catch (Exception ex)
+			{
+				throw new ApplicationException($"Could not decompile '{assemblyFileName}' as project: {ex.Message}", ex);
+			}
 		}
 
 		int Decompile(string assemblyFileName, TextWriter output, string typeName = null)
