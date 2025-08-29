@@ -63,6 +63,8 @@
     <PackageReference Include="Microsoft.Extensions.Hosting" />
     <PackageReference Include="NuGet.Protocol" />
     <PackageReference Include="System.Security.Cryptography.Pkcs" />
+    <PackageReference Include="Spectre.Console" />
+    <PackageReference Include="System.Threading.Channels" />
   </ItemGroup>
 
   <Target Name="ILSpyUpdateAssemblyInfo" AfterTargets="ResolveProjectReferences">
@@ -70,5 +72,9 @@
       <Output TaskParameter="Lines" PropertyName="PackageVersion" />
     </ReadLinesFromFile>
   </Target>
-
+  
+  <PropertyGroup>
+    <ServerGarbageCollection>true</ServerGarbageCollection>
+    <GarbageCollectionAdaptationMode>1</GarbageCollectionAdaptationMode>
+  </PropertyGroup>
 </Project>

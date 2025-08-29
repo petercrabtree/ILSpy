@@ -1,4 +1,5 @@
 using System;
+using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.ComponentModel.DataAnnotations;
 using System.IO;
@@ -8,6 +9,7 @@ using System.Linq;
 using System.Reflection.Metadata;
 using System.Reflection.PortableExecutable;
 using System.Threading;
+using System.Threading.Channels;
 using System.Threading.Tasks;
 
 using ICSharpCode.Decompiler;
@@ -24,6 +26,8 @@ using ICSharpCode.ILSpyX.PdbProvider;
 using McMaster.Extensions.CommandLineUtils;
 
 using Microsoft.Extensions.Hosting;
+
+using Spectre.Console;
 
 // ReSharper disable UnassignedGetOnlyAutoProperty
 
@@ -44,6 +48,11 @@ Examples:
 
     Decompile assembly to destination directory, create a project file, one source file per type.
         ilspycmd -p -o c:\decompiled sample.dll
+
+    Decompile multiple assemblies into a single solution, using all available cores.
+        ilspycmd -p -o c:\decompiled -j 0 sample.dll sample2.dll sample3.dll sample4.dll
+		(or with max of 4 parallel jobs)
+        ilspycmd -p -o c:\decompiled -j 4 s1.dll s2.dll s3.dll s4.dll s5.dll s6.dll s7.dll s8.dll
 
     Decompile assembly to destination directory, create a project file, one source file per type, 
     into nicely nested directories.
@@ -90,6 +99,12 @@ Examples:
 				CommandOptionType.NoValue)]
 		public bool CreateCompilableProjectFlag { get; }
 
+		[Option("-j|--jobs",
+			"Sets the maximum number of parallel jobs for project decompilation. " +
+			"Pass 0 to use Environment.ProcessorCount (the logical processor count sans cpus not available to this process).",
+			CommandOptionType.SingleValue)]
+		public int Jobs { get; } = 1;
+
 		[Option("-t|--type <type-name>",
 			"The fully qualified name of the type to decompile.",
 			CommandOptionType.SingleValue)]
@@ -115,8 +130,7 @@ Examples:
 		public (bool IsSet, string Value) InputPDBFile { get; }
 
 		[Option("-l|--list <entity-type(s)>",
-			"Lists all entities of the specified type(s). " +
-				"Valid types: c(lass), i(nterface), s(truct), d(elegate), e(num)",
+			"Lists all entities of the specified type(s). Valid types: c(lass), i(nterface), s(truct), d(elegate), e(num)",
 			CommandOptionType.MultipleValue)]
 		public string[] EntityTypes { get; } = [];
 
@@ -163,7 +177,6 @@ Examples:
 			"If using ilspycmd in a tight loop or fully automated scenario, you might want to disable the automatic update check.",
 			CommandOptionType.NoValue)]
 		public bool DisableUpdateCheck { get; }
-
 		#region MermaidDiagrammer options
 
 		// reused or quoted commands
@@ -284,8 +297,7 @@ Examples:
 					DecompileAsProject(InputAssemblyNames[0], outputDirectory, GetSettings(), ReferencePaths, InputPDBFile);
 					return 0;
 				}
-
-				DecompileAsSolution(outputDirectory, InputAssemblyNames, GetSettings(), ReferencePaths, InputPDBFile);
+				await DecompileAsSolutionAsync(outputDirectory, InputAssemblyNames, GetSettings(), ReferencePaths, InputPDBFile, Jobs);
 			}
 			else if (GenerateDiagrammer)
 			{
@@ -401,7 +413,7 @@ Examples:
 					ThrowOnAssemblyResolveErrors = false,
 					RemoveDeadCode = RemoveDeadCode,
 					RemoveDeadStores = RemoveDeadStores,
-					UseSdkStyleProjectFormat = true,
+					UseSdkStyleProjectFormat = true, // default to sdk style, but this gets set elsewhere (based on the module being decompiled)
 					UseNestedDirectoriesForNamespaces = NestedDirectories,
 				};
 			}
@@ -451,7 +463,11 @@ Examples:
 			return decompilerSettings;
 		}
 
-		static CSharpDecompiler GetDecompiler(DecompilerSettings settings, string assemblyFileName, string[] referencePaths, (bool IsSet, string Value) inputPDBFile)
+		static CSharpDecompiler GetDecompiler(
+			DecompilerSettings settings,
+			string assemblyFileName,
+			string[] referencePaths,
+			(bool IsSet, string Value) inputPDBFile)
 		{
 			var module = new PEFile(assemblyFileName);
 			var resolver = new UniversalAssemblyResolver(
@@ -463,6 +479,9 @@ Examples:
 				resolver.AddSearchDirectory(path);
 			}
 
+			// we need to configure the settings using the module
+			// each decompiler instance getting its own settings clone
+			// means that we can ignore the settings object's thread-safety
 			settings.UseSdkStyleProjectFormat = WholeProjectDecompiler.CanUseSdkStyleProjectFormat(module);
 			return new CSharpDecompiler(assemblyFileName, resolver, settings) {
 				DebugInfoProvider = TryLoadPDB(module, inputPDBFile),
@@ -494,40 +513,175 @@ Examples:
 				DebugInfo = TryLoadPDB(module, InputPDBFile),
 				ShowSequencePoints = ShowILSequencePointsFlag,
 			};
+
 			disassembler.WriteModuleContents(module);
 			return 0;
 		}
 
-		static void DecompileAsSolution(string outputDirectory, string[] inputAssemblyNames, DecompilerSettings settings, string[] referencePaths,
-			(bool IsSet, string Value) inputPDBFile)
+		static async Task DecompileAsSolutionAsync(
+				string outputDirectory,
+				string[] inputAssemblyNames,
+				DecompilerSettings settings,
+				string[] referencePaths,
+				(bool IsSet, string Value) inputPDBFile,
+				int maxDegreeOfParallelism)
 		{
-			var projects = new List<ProjectItem>();
-			foreach (var file in inputAssemblyNames)
-			{
-				string projectFileName = Path.Combine(
-					outputDirectory,
-					Path.GetFileNameWithoutExtension(file),
-					Path.GetFileNameWithoutExtension(file) + ".csproj");
-				Directory.CreateDirectory(Path.GetDirectoryName(projectFileName)!);
-				ProjectId projectId = DecompileAsProject(
-					file,
-					projectFileName,
-					settings,
-					referencePaths,
-					inputPDBFile);
-				projects.Add(new ProjectItem(
-					projectFileName,
-					projectId.PlatformName,
-					projectId.Guid,
-					projectId.TypeGuid));
-			}
+			var projects = new ConcurrentBag<ProjectItem>();
+			maxDegreeOfParallelism = maxDegreeOfParallelism <= 0 ? Environment.ProcessorCount : maxDegreeOfParallelism;
+			var progressDisplay = AnsiConsole
+				.Progress()
+				.AutoRefresh(true)
+				.AutoClear(false)
+				.HideCompleted(inputAssemblyNames.Length > 40) // could be way too many tasks to show all, 40 seems like a reasonable cutoff
+				.Columns(
+					new TaskDescriptionColumn(),
+					new ProgressBarColumn(),
+					new PercentageColumn(),
+					new SpinnerColumn(),
+					new ElapsedTimeColumn());
+			await progressDisplay.StartAsync(async ctx => {
+				ctx.Refresh();
+				// one main task to show the overall progress
+				var projectTrackingTask = ctx.AddTask("Overall Project Progress",
+					new ProgressTaskSettings { AutoStart = false, MaxValue = inputAssemblyNames.Length });
+				projectTrackingTask.StartTask();
+				// pre-generate the tasks for deterministic order
+				var taskPairs = inputAssemblyNames.Select(name => {
+					var task = ctx.AddTask(name, new ProgressTaskSettings {
+						AutoStart = false,
+					});
+					task.IsIndeterminate = true;
+					return (
+						name,
+						task,
+						settings,
+						referencePaths,
+						inputPDBFile,
+						projects,
+						outputDirectory,
+						projectTrackingTask
+					);
+				}).ToList();
+				await Parallel.ForEachAsync(
+					taskPairs,
+					new ParallelOptions { MaxDegreeOfParallelism = maxDegreeOfParallelism },
+					async (projectContext, token) => {
+						var progress = new Progress<DecompilationProgress>(value => {
+							// this callback must be thread-safe, as it will be called from the threadpool
+							// (or whatever SynchronizationContext is in play)
+							//
+							// so we must lock an object to ensure this callback is serialized
+							// the task object is a fine object to lock on
+							var task = projectContext.task;
+							lock (task)
+							{
+								// we can avoid the task object doing wasteful locking
+								// (which doesn't matter a lot, but this callback can get called a lot)
+								if (value.TotalUnits <= 0)
+								{
+									if (!task.IsIndeterminate) // avoid lock
+									{
+										task.IsIndeterminate = true;
+									}
+								}
+								else
+								{
+									var fractionDoneBefore = task.MaxValue == 0 ? 0 : task.Value / task.MaxValue;
+									double? _fractionDoneNow = value.TotalUnits == 0 ? null : (double)value.UnitsCompleted / value.TotalUnits;
+									var fractionDoneNow = _fractionDoneNow.Value;
+									// clamp to 0-1 in case of bad progress reporting:
+									fractionDoneNow = Math.Max(0, Math.Min(1, fractionDoneNow));
+									fractionDoneBefore = Math.Max(0, Math.Min(1, fractionDoneBefore));
+									if (task.IsIndeterminate) // avoid lock
+									{
+										task.IsIndeterminate = false;
+									}
+									if (task.MaxValue != value.TotalUnits) // etc
+									{
+										task.MaxValue = value.TotalUnits;
+									}
+									if (task.Value != value.UnitsCompleted) // etc
+									{
+										task.Value = value.UnitsCompleted;
+									}
+									if (fractionDoneNow > fractionDoneBefore)
+									{
+										// A subtle thread-safety point: we only ever *increase* the overall progress, never decrease it
+										// because while it generally won't be the case that progress callbacks are called out of order,
+										// there's no guarantee
+										// 
+										// However, by only ever increasing, we can't process them out of order,
+										// (assuming TotalUnits is non-increasing and UnitsCompleted is non-decreasing)
+										// and thus we can incrementally update the overall progress without recalculating anything
+										// or doing any expensive serialization
 
-			SolutionCreator.WriteSolutionFile(
-				Path.Combine(outputDirectory, Path.GetFileNameWithoutExtension(outputDirectory) + ".sln"),
-				projects);
+										// this isn't numerically stable (each project will likely add a tiny bit more or less than exactly 1 unit of progress,
+										// so we may not total exactly 1.0 at the end),
+										// but a double should have plenty of precision to be close enough and this is simple and very fast
+
+										// update overall progress
+										projectTrackingTask.Increment(fractionDoneNow - fractionDoneBefore);
+									}
+								}
+							}
+						});
+						await DecompileProjectAsync(projectContext, token, progress);
+						projectContext.task.StopTask();
+					});
+
+				var solutionTask = ctx.AddTask("Writing Solution File & Fixing Project References", new ProgressTaskSettings { MaxValue = 1 });
+
+				SolutionCreator.WriteSolutionFile(
+					Path.Combine(outputDirectory, Path.GetFileNameWithoutExtension(outputDirectory) + ".sln"),
+					projects.OrderBy(p => p.ProjectName).ToList());
+
+				solutionTask.Increment(1);
+				solutionTask.StopTask();
+
+				// order by project name for (more) deterministic output
+				// (plus it's probably what other tools do for maximum compatibility)
+			});
+		}
+		static async ValueTask DecompileProjectAsync(
+				(string name, ProgressTask task, DecompilerSettings settings, string[] referencePaths, (bool IsSet, string Value) inputPDBFile, ConcurrentBag<ProjectItem> projects, string outputDirectory, ProgressTask projectTrackingTask) projectContext,
+				CancellationToken token,
+				IProgress<DecompilationProgress> progress)
+		{
+			var (file, progressTask, settings, referencePaths, inputPDBFile, projects, outputDirectory, projectTrackingTask) = projectContext;
+			// add to the project display
+			progressTask.StartTask();
+
+			// ensure the directory and extract the base name
+			var fileBaseName = Path.GetFileNameWithoutExtension(file);
+			var projectDirectory = Path.Combine(outputDirectory, fileBaseName);
+			Directory.CreateDirectory(projectDirectory);
+			string projectFileName = Path.Combine(projectDirectory, $"{fileBaseName}.csproj");
+
+			var projectId = DecompileAsProject(
+				file,
+				projectDirectory,
+				settings.Clone(), // MUST be cloned, as DecompileAsProject will set UseSdkStyleProjectFormat
+				referencePaths,
+				inputPDBFile,
+				progress);
+
+			// projects is a ConcurrentBag, so it's thread-safe
+			projects.Add(new ProjectItem(
+				projectFileName,
+				projectId.PlatformName,
+				projectId.Guid,
+				projectId.TypeGuid));
+
+			progressTask.StopTask(); // remove from the progress display
 		}
 
-		static ProjectId DecompileAsProject(string assemblyFileName, string outputDirectory, DecompilerSettings settings, string[] referencePaths, (bool IsSet, string Value) inputPDBFile)
+		static ProjectId DecompileAsProject(
+			string assemblyFileName,
+			string outputDirectory,
+			DecompilerSettings settings,
+			string[] referencePaths,
+			(bool IsSet, string Value) inputPDBFile,
+			IProgress<DecompilationProgress> progress = null)
 		{
 			try
 			{
@@ -553,7 +707,13 @@ Examples:
 					resolver,
 					TryLoadPDB(module, inputPDBFile));
 				using var projectFileWriter = new StreamWriter(File.OpenWrite(projectFileName));
-				return decompiler.DecompileProject(module, Path.GetDirectoryName(projectFileName), projectFileWriter);
+				decompiler.ProgressIndicator = progress;
+				var result = decompiler.DecompileProject(
+					module,
+					Path.GetDirectoryName(projectFileName),
+					projectFileWriter);
+				decompiler.ProgressIndicator = null;
+				return result;
 			}
 			catch (Exception ex)
 			{
@@ -561,8 +721,13 @@ Examples:
 			}
 		}
 
-		static int Decompile(string assemblyFileName, TextWriter output, DecompilerSettings settings,
-			string[] referencePaths, string typeName, (bool IsSet, string Value) inputPDBFile)
+		static int Decompile(
+			string assemblyFileName,
+			TextWriter output,
+			DecompilerSettings settings,
+			string[] referencePaths,
+			string typeName,
+			(bool IsSet, string Value) inputPDBFile)
 		{
 			CSharpDecompiler decompiler = GetDecompiler(settings, assemblyFileName, referencePaths, inputPDBFile);
 
