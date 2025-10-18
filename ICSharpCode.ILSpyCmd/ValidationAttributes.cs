@@ -20,7 +20,7 @@ namespace ICSharpCode.ILSpyCmd
 			{
 				if (obj.CreateCompilableProjectFlag && string.IsNullOrEmpty(obj.OutputDirectory))
 				{
-					return new ValidationResult("--project cannot be used unless --outputdir is also specified");
+					return new ValidationResult("you must specify --outputdir (-o) when using --project (-p)");
 				}
 			}
 			return ValidationResult.Success;
